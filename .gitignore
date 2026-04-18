@@ -1,0 +1,36 @@
+# Rust
+/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Maturin / wheels
+/cli/target/
+*.whl
+
+# Test output
+*.parquet
+*.csv
+*.jsonl
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Claude Code session files
+.claude/
+.remember/
+
+# OS
+.DS_Store
+Thumbs.db

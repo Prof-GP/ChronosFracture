@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "supertimeline"
+version = "0.1.0"
+description = "High-performance forensic super-timeline generator"
+requires-python = ">=3.10"
+dependencies = [
+    "pyarrow>=14.0.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "python-registry>=1.3.1",
+]
+
+[project.optional-dependencies]
+windows = ["windowsprefetch>=4.0.3", "pytsk3"]
+linux   = ["pytsk3"]
+
+[project.scripts]
+supertimeline = "supertimeline.main:entry_point"
+
+[tool.maturin]
+module-name = "supertimeline_core"
+manifest-path = "../core/Cargo.toml"
+features = ["pyo3/extension-module"]
+python-packages = ["supertimeline"]

@@ -1,0 +1,11 @@
+# Clippy configuration for supertimeline
+# Forensic tool standards: no silent panics, no data loss, explicit error handling
+
+# Disallow unwrap() — every failure must be an explicit, recoverable error
+disallowed-methods = [
+    { path = "std::option::Option::unwrap", reason = "Use ok_or() or if let — unwrap() panics silently and loses forensic data" },
+    { path = "std::result::Result::unwrap", reason = "Use ? or map_err() — unwrap() panics silently and loses forensic data" },
+]
+
+# Minimum length for type aliases to trigger a warning
+type-complexity-threshold = 250

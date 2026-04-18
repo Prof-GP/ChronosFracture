@@ -1,0 +1,31 @@
+[package]
+name = "supertimeline-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "supertimeline_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+rayon = "1.10"
+memmap2 = "0.9"
+byteorder = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+arrow = { version = "53", features = ["ipc"] }
+parquet = { version = "53", features = ["arrow"] }
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.11"
+uuid = { version = "1.8", features = ["v4"] }
+encoding_rs = "0.8"
+flate2 = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
