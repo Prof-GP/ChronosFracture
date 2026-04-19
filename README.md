@@ -123,3 +123,13 @@ JSONL and CSV are also supported (`-f jsonl` / `-f csv`).
 ## Full Documentation
 
 See [MANUAL.md](MANUAL.md) for the complete analyst reference including CLI options, parser details, timestomp detection, Timesketch integration, and troubleshooting.
+
+---
+
+## License
+
+ChronosFracture is free for personal, academic, educational, and non-profit use under the [ChronosFracture Non-Commercial License](LICENSE).
+
+**Commercial use requires a paid license.** This includes use within for-profit organizations, incorporation into commercial products or services, and providing paid forensic or incident response services using this tool.
+
+To obtain a commercial license, contact: practical4n6@gmail.com
