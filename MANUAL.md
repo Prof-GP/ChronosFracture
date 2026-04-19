@@ -296,6 +296,8 @@ Options:
   --no-sort                 Skip final timestamp sort (faster, unsorted output)
   --discover-only           List discovered artifacts without parsing
   --summary / --no-summary  Print per-artifact summary on completion
+  --recover-usnjrnl         Carve zeroed $J streams for recovered USN records (fast)
+  --recover-usnjrnl-deep    Carve entire image for USN records incl. unallocated (slow)
   --help                    Show this message and exit.
 ```
 
@@ -319,7 +321,62 @@ supertimeline E:\ --discover-only
 
 # Extracted artifacts directory
 supertimeline C:\Cases\001\artifacts\ -o timeline.parquet
+
+# Recover wiped USN journal records from a zeroed $J stream (fast)
+supertimeline case.E01 -o case001.parquet --recover-usnjrnl
+
+# Deep carve — scan entire image for USN records including unallocated space (slow)
+supertimeline case.E01 -o case001.parquet --recover-usnjrnl-deep
 ```
+
+---
+
+## 6a. USN Journal Recovery
+
+When an attacker wipes the `$UsnJrnl:$J` stream (e.g. via `fsutil usn deletejournal`
+or by zeroing it in-place), the live parser returns zero records. supertimeline can
+attempt to recover USN records from the remnant data.
+
+### `--recover-usnjrnl` (fast — recommended first pass)
+
+Reads the `$J` stream directly from the image and scans for USN v2 record structures,
+skipping zero-filled regions. Effective when the journal was zeroed in-place rather
+than properly deleted, as attackers often miss the tail of the stream.
+
+Recovered events appear in the timeline tagged with `artifact = "$J (Recovered)"` so
+they can be filtered and treated with appropriate confidence.
+
+```bash
+supertimeline case.E01 -o case001.parquet --recover-usnjrnl
+```
+
+```python
+# Filter recovered records in pandas / DuckDB
+df[df["artifact"] == "$J (Recovered)"]
+```
+
+### `--recover-usnjrnl-deep` (slow — full image carve)
+
+Reads the entire raw image sequentially and scans every byte for USN v2 signatures.
+Catches records in unallocated clusters, file slack space, and volume shadow copies.
+Use after `--recover-usnjrnl` yields insufficient results.
+
+**Warning:** On large images (500 GB+) this can take 30–60+ minutes depending on I/O speed.
+
+```bash
+supertimeline case.E01 -o case001.parquet --recover-usnjrnl-deep
+```
+
+### What counts as a valid recovered record
+
+The carver validates each candidate against the USN v2 structure:
+- `RecordLength` ≥ 60, ≤ 65536, divisible by 8
+- `MajorVersion` = 2, `MinorVersion` = 0
+- `FileName` offset and length within record bounds
+- Valid UTF-16 LE filename
+
+Records with zeroed FILETIMEs (timestamp = 0) are included but appear with a blank
+`timestamp_iso` — the filename and reason codes are still forensically useful.
 
 ---
 

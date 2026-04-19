@@ -81,7 +81,17 @@ supertimeline run E:\ --discover-only
 
 # Parse an extracted artifacts directory
 supertimeline run C:\Cases\artifacts\ -o case001.parquet
+
+# Recover wiped USN journal records from a zeroed $J stream (fast)
+supertimeline case.E01 -o case001.parquet --recover-usnjrnl
+
+# Deep carve — scan entire image for USN records including unallocated space (slow)
+supertimeline case.E01 -o case001.parquet --recover-usnjrnl-deep
 ```
+
+### USN Journal Recovery
+
+When `$UsnJrnl:$J` has been wiped, use `--recover-usnjrnl` to carve remnant USN records from the zeroed stream. Recovered events are tagged `artifact = "$J (Recovered)"` in the output so they can be distinguished from live records. Use `--recover-usnjrnl-deep` to additionally scan unallocated space and the full raw image (significantly slower on large images).
 
 ---
 
