@@ -156,6 +156,18 @@ class StreamingWriter:
         self.close()
 
 
+def merge_and_sort_parquet(input_paths: list, output_path: str) -> int:
+    """Merge multiple Parquet files and sort by timestamp_ns."""
+    if not ARROW_AVAILABLE:
+        raise RuntimeError("pyarrow required")
+    import pyarrow as pa
+    tables = [pq.read_table(p) for p in input_paths if Path(p).exists()]
+    merged = pa.concat_tables(tables)
+    sorted_table = merged.sort_by([("timestamp_ns", "ascending")])
+    pq.write_table(sorted_table, output_path, compression="snappy")
+    return len(sorted_table)
+
+
 def sort_parquet_by_timestamp(input_path: str, output_path: str):
     """
     Sort an existing Parquet file by timestamp_ns using Arrow.

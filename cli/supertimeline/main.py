@@ -40,7 +40,11 @@ def _banner():
               help="List artifacts without parsing")
 @click.option("--no-summary", is_flag=True, default=False,
               help="Suppress per-artifact summary table")
-def run(root_path, output, format, workers, no_sort, discover_only, no_summary):
+@click.option("--recover-usnjrnl", is_flag=True, default=False,
+              help="Carve zeroed $J streams for recovered USN records (fast)")
+@click.option("--recover-usnjrnl-deep", is_flag=True, default=False,
+              help="Carve entire image for USN records including unallocated space (slow)")
+def run(root_path, output, format, workers, no_sort, discover_only, no_summary, recover_usnjrnl, recover_usnjrnl_deep):
     """
     Generate a forensic super-timeline from ROOT_PATH.
 
@@ -141,6 +145,69 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary):
 
     parse_elapsed = time.perf_counter() - parse_start
 
+    # ── USN Journal recovery ─────────────────────────────────────────────────
+    recovered_parquet = None
+    if recover_usnjrnl or recover_usnjrnl_deep:
+        console.print()
+        console.print("[cyan]USN Journal recovery:[/cyan] scanning for wiped records...")
+        recovered_events = []
+
+        from supertimeline.parsers.usnjrnl_recover import (
+            recover_from_image, recover_from_zeroed_j, recover_from_zeroed_j_image
+        )
+
+        usnjrnl_live_events = sum(
+            r.event_count for r in orc._results if r.artifact_type == "USNJRNL"
+        )
+
+        # 1. Scan zeroed $J — triggered when $J existed on image but live parse
+        #    found nothing (extractor skips all-zero streams, so check the image directly)
+        if usnjrnl_live_events == 0 and orc.original_path != orc.root:
+            with console.status("[cyan]Carving zeroed $J stream from image...[/cyan]"):
+                evs = recover_from_zeroed_j_image(orc.original_path)
+            if evs:
+                recovered_events.extend(evs)
+                console.print(
+                    f"  [green]RECOVERED[/green] [cyan]USNJRNL[/cyan] "
+                    f"[white]{len(evs):>8,}[/white] events  [dim](zeroed $J)[/dim]"
+                )
+        elif usnjrnl_live_events == 0:
+            # Extracted dir — check for a zeroed UsnJrnl_J file
+            for job in jobs:
+                if job.artifact_type == "USNJRNL":
+                    with console.status(f"[cyan]Carving zeroed $J: {os.path.basename(job.path)}[/cyan]"):
+                        evs = recover_from_zeroed_j(job.path)
+                    if evs:
+                        recovered_events.extend(evs)
+                        console.print(
+                            f"  [green]RECOVERED[/green] [cyan]USNJRNL[/cyan] "
+                            f"[white]{len(evs):>8,}[/white] events  [dim](zeroed $J)[/dim]"
+                        )
+
+        # 2. Full image scan — only when --recover-usnjrnl-deep is set (slow)
+        if recover_usnjrnl_deep and orc.original_path != orc.root:
+            console.print("  [yellow]Deep scan:[/yellow] scanning full image (this may take a while)...")
+            with console.status("[cyan]Carving image for USN records...[/cyan]"):
+                evs = recover_from_image(orc.original_path)
+            if evs:
+                recovered_events.extend(evs)
+                console.print(
+                    f"  [green]RECOVERED[/green] [cyan]USNJRNL[/cyan] "
+                    f"[white]{len(evs):>8,}[/white] events  [dim](full image scan)[/dim]"
+                )
+
+        if not recovered_events:
+            console.print("  [dim]No additional USN records recovered.[/dim]")
+        else:
+            total_events += len(recovered_events)
+            # Write recovered events to a sidecar parquet; merged into main before sort
+            recovered_parquet = output.replace(".parquet", "_recovered_tmp.parquet")
+            with StreamingWriter(recovered_parquet, format="parquet") as rw:
+                rw.write_events(recovered_events)
+            console.print(
+                f"  [bold green]{len(recovered_events):,} total USN records recovered[/bold green]"
+            )
+
     # ── Sort ────────────────────────────────────────────────────────────────
     sort_elapsed = 0.0
     sorted_path = output
@@ -149,7 +216,12 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary):
         with console.status(f"[cyan]Sorting {total_events:,} events by timestamp...[/cyan]"):
             t_sort = time.perf_counter()
             sorted_path = output.replace(".parquet", "_sorted.parquet")
-            sort_parquet_by_timestamp(output, sorted_path)
+            if recovered_parquet and os.path.exists(recovered_parquet):
+                from supertimeline.storage.writer import merge_and_sort_parquet
+                merge_and_sort_parquet([output, recovered_parquet], sorted_path)
+                os.remove(recovered_parquet)
+            else:
+                sort_parquet_by_timestamp(output, sorted_path)
             sort_elapsed = time.perf_counter() - t_sort
         console.print(f"[green]Sorted:[/green] {sorted_path} ({sort_elapsed:.1f}s)")
 
