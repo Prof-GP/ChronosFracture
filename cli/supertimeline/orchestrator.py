@@ -355,23 +355,23 @@ class Orchestrator:
         then treat extracted dir as root (temp dir cleaned up on close)
     """
 
-    def __init__(self, root: str, max_workers: int = 0, output_format: str = "parquet"):
+    def __init__(self, root: str, max_workers: int = 0, output_format: str = "parquet",
+                 progress_cb=None):
         self.original_path = root
         self.max_workers = max_workers or os.cpu_count() or 4
         self.output_format = output_format
         self._jobs: List[ArtifactJob] = []
         self._results: List[ParseResult] = []
-        self._tmp_dir: Optional[str] = None   # temp dir from image extraction
-        self.root, self.image_format = self._resolve_root(root)
+        self._tmp_dir: Optional[str] = None
+        self.root, self.image_format = self._resolve_root(root, progress_cb)
 
-    def _resolve_root(self, path: str):
+    def _resolve_root(self, path: str, progress_cb=None):
         from supertimeline.image import open_image, ImageFormat
         try:
-            root, fmt, tmp = open_image(path)
+            root, fmt, tmp = open_image(path, progress_cb=progress_cb)
             self._tmp_dir = tmp
             return root, fmt
         except RuntimeError as exc:
-            # Re-raise so the CLI can show a clear message
             raise
 
     def discover(self) -> List[ArtifactJob]:

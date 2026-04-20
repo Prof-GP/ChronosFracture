@@ -281,7 +281,8 @@ def _get_partition_offset(img_info) -> int:
     return 0
 
 
-def extract_artifacts_from_image(image_path: str, fmt: ImageFormat) -> Optional[str]:
+def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
+                                  progress_cb=None) -> Optional[str]:
     """
     Extract forensic artifacts from an image file into a temp directory.
 
@@ -332,6 +333,8 @@ def extract_artifacts_from_image(image_path: str, fmt: ImageFormat) -> Optional[
         _DIR_TARGETS = {"Windows/System32/winevt/Logs", "Windows/Prefetch"}
 
         for src_path, dest_name in _EXTRACT_TARGETS.items():
+            if progress_cb:
+                progress_cb(src_path)
             dest = os.path.join(tmp_dir, dest_name)
             if src_path in _DIR_TARGETS:
                 _tsk_extract_dir(fs, src_path, dest)
@@ -412,7 +415,7 @@ MOUNT_INSTRUCTIONS = {
 }
 
 
-def open_image(path: str) -> Tuple[str, ImageFormat, Optional[str]]:
+def open_image(path: str, progress_cb=None) -> Tuple[str, ImageFormat, Optional[str]]:
     """
     Resolve an image path to a root directory for artifact discovery.
 
@@ -432,7 +435,7 @@ def open_image(path: str) -> Tuple[str, ImageFormat, Optional[str]]:
     if _TSK_AVAILABLE and fmt in (ImageFormat.RAW, ImageFormat.EWF,
                                    ImageFormat.VMDK, ImageFormat.VHD,
                                    ImageFormat.VHDX):
-        tmp = extract_artifacts_from_image(path, fmt)
+        tmp = extract_artifacts_from_image(path, fmt, progress_cb=progress_cb)
         if tmp:
             return tmp, fmt, tmp
 

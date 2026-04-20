@@ -10,6 +10,7 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
 from rich.panel import Panel
 from rich.text import Text
+from rich.console import Group
 
 from supertimeline.orchestrator import Orchestrator
 from supertimeline.storage.writer import StreamingWriter, sort_parquet_by_timestamp
@@ -17,12 +18,62 @@ from supertimeline.storage.writer import StreamingWriter, sort_parquet_by_timest
 console = Console()
 
 
+_CLOCK = [
+    r"   .-------.  ",
+    r"  /   12    \ ",
+    r" | 9    .  3| ",
+    r" |      |/   ",
+    r"  \ 6   |  / ",
+    r"   '----'--' ",
+]
+
+
 def _banner():
-    console.print(Panel.fit(
-        "[bold cyan]supertimeline[/bold cyan] [dim]v0.1.0[/dim]\n"
-        "[dim]Forensic super-timeline generator | Rust core + Arrow storage[/dim]",
-        border_style="cyan",
-    ))
+    try:
+        import pyfiglet
+
+        def _art_lines(s: str):
+            lines = s.rstrip("\n").split("\n")
+            while lines and not lines[-1].strip():
+                lines.pop()
+            w = max(len(l.rstrip()) for l in lines)
+            return [l.ljust(w) for l in lines]
+
+        art_lines = _art_lines(pyfiglet.Figlet(width=200).renderText("ChronosFracture"))
+
+        # Pad art vertically to match clock height
+        clock_h = len(_CLOCK)
+        art_h   = len(art_lines)
+        pad_top = (clock_h - art_h) // 2
+        art_padded = [""] * pad_top + art_lines + [""] * (clock_h - art_h - pad_top)
+
+        clock_w = max(len(l) for l in _CLOCK)
+        rows = [c.ljust(clock_w) + "  " + a for c, a in zip(_CLOCK, art_padded)]
+        combined   = "\n".join(rows)
+        combined_w = max(len(r) for r in rows)
+
+        sub = "supertimeline".center(combined_w)
+        tag = "Forensic super-timeline generator  |  v0.1.0".center(combined_w)
+        sep = "-" * combined_w
+
+        content = Group(
+            Text(combined, style="bold cyan", no_wrap=True),
+            Text(""),
+            Text(sub,  style="cyan"),
+            Text(sep,  style="dim"),
+            Text(tag,  style="dim"),
+        )
+        console.print(Panel.fit(content, border_style="cyan", padding=(0, 1)))
+    except ImportError:
+        W = 52
+        content = (
+            f"[bold cyan]{'ChronosFracture'.center(W)}[/bold cyan]\n"
+            f"[cyan]{'supertimeline'.center(W)}[/cyan]\n"
+            f"[dim]{'-' * W}[/dim]\n"
+            f"[dim]{'Forensic super-timeline generator  |  v0.1.0'.center(W)}[/dim]"
+        )
+        console.print(Panel.fit(content, border_style="cyan", padding=(0, 2)))
+    console.print()
 
 
 @click.command()
@@ -38,13 +89,13 @@ def _banner():
               help="Skip timestamp sort (parquet only)")
 @click.option("--discover-only", is_flag=True, default=False,
               help="List artifacts without parsing")
-@click.option("--no-summary", is_flag=True, default=False,
-              help="Suppress per-artifact summary table")
+@click.option("--debug", is_flag=True, default=False,
+              help="Show per-artifact breakdown after parsing")
 @click.option("--recover-usnjrnl", is_flag=True, default=False,
               help="Carve zeroed $J streams for recovered USN records (fast)")
 @click.option("--recover-usnjrnl-deep", is_flag=True, default=False,
               help="Carve entire image for USN records including unallocated space (slow)")
-def run(root_path, output, format, workers, no_sort, discover_only, no_summary, recover_usnjrnl, recover_usnjrnl_deep):
+def run(root_path, output, format, workers, no_sort, discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep):
     """
     Generate a forensic super-timeline from ROOT_PATH.
 
@@ -59,23 +110,32 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary, 
       supertimeline C:\\ --discover-only
     """
     _banner()
-
+    wall_start  = time.perf_counter()
     max_workers = workers if workers > 0 else os.cpu_count()
-    console.print(f"[bold]Input:[/bold]   {root_path}")
-    console.print(f"[bold]Output:[/bold]  {output} ({format.upper()})")
-    console.print(f"[bold]Workers:[/bold] {max_workers} threads\n")
 
     # ── Open image ──────────────────────────────────────────────────────────
     try:
-        with console.status("[cyan]Opening image...[/cyan]"):
-            orc = Orchestrator(root_path, max_workers=max_workers, output_format=format)
+        with console.status("[cyan]Opening image...[/cyan]") as status:
+            def _extract_cb(src_path: str):
+                label = src_path.split("/")[-1] or src_path
+                status.update(f"[cyan]Extracting  [bold]{label}[/bold]...[/cyan]")
+            orc = Orchestrator(root_path, max_workers=max_workers,
+                               output_format=format, progress_cb=_extract_cb)
     except RuntimeError as exc:
         console.print(f"[red bold]Cannot open image:[/red bold]\n{exc}")
         sys.exit(1)
 
-    console.print(f"[bold]Format:[/bold]  [cyan]{orc.image_format.name}[/cyan]")
+    # Run info table — printed once after image opens so we have the format name
+    info = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2))
+    info.add_column(style="bold cyan",  no_wrap=True)
+    info.add_column(style="white",      no_wrap=True)
+    info.add_row("Input",   root_path)
+    info.add_row("Output",  f"{output}  ({format.upper()})")
+    info.add_row("Format",  orc.image_format.name)
+    info.add_row("Workers", f"{max_workers} threads")
     if orc.root != root_path:
-        console.print(f"[bold]Extracted to:[/bold] [dim]{orc.root}[/dim]")
+        info.add_row("Extracted", f"[dim]{orc.root}[/dim]")
+    console.print(info)
     console.print()
 
     # ── Discovery ───────────────────────────────────────────────────────────
@@ -88,12 +148,19 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary, 
         console.print("[yellow]No artifacts found.[/yellow]")
         sys.exit(1)
 
-    tbl = Table(title=f"Discovered Artifacts ({len(jobs)} items, {discovery_secs:.2f}s)")
-    tbl.add_column("Type",  style="cyan",  no_wrap=True)
-    tbl.add_column("Path",  style="white")
-    tbl.add_column("Size",  style="green", justify="right")
+    # Compact discovery summary — one row per type, not per file
+    from collections import defaultdict
+    type_summary: dict = defaultdict(lambda: {"count": 0, "size_mb": 0.0})
     for job in jobs:
-        tbl.add_row(job.artifact_type, job.path, f"{job.size_bytes/1_048_576:.1f} MB")
+        type_summary[job.artifact_type]["count"]   += 1
+        type_summary[job.artifact_type]["size_mb"] += job.size_bytes / 1_048_576
+
+    tbl = Table(title=f"Discovered Artifacts  ({len(jobs)} files, {discovery_secs:.2f}s)")
+    tbl.add_column("Type",   style="cyan",  no_wrap=True)
+    tbl.add_column("Files",  style="white", justify="right")
+    tbl.add_column("Size",   style="green", justify="right")
+    for atype, info in sorted(type_summary.items()):
+        tbl.add_row(atype, str(info["count"]), f"{info['size_mb']:.1f} MB")
     console.print(tbl)
 
     if discover_only:
@@ -105,21 +172,30 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary, 
     errors = 0
     parse_start = time.perf_counter()
 
-    # Aggregate counts per artifact type for the live display
     type_counts: dict = {}
+
+    # Pre-count files per type so we know when a section is fully done
+    from collections import defaultdict as _dd
+    type_totals:  dict = {}
+    for job in jobs:
+        type_totals[job.artifact_type] = type_totals.get(job.artifact_type, 0) + 1
+    type_done:    dict = {}
+    type_evts:    dict = {}
+    type_errs:    dict = {}
+    type_t0:      dict = {}
 
     with StreamingWriter(output, format=format) as writer:
         with Progress(
-            SpinnerColumn(spinner_name="line"),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
+            SpinnerColumn(spinner_name="dots"),
+            TextColumn("[cyan]{task.fields[current]:<12}[/cyan]"),
+            BarColumn(bar_width=35),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
-            TextColumn("[cyan]{task.fields[events]}[/cyan] events"),
+            TextColumn("[bold cyan]{task.fields[events]}[/bold cyan] events"),
             console=console,
             transient=False,
         ) as progress:
-            task = progress.add_task("[cyan]Parsing...[/cyan]", total=len(jobs), events="0")
+            task = progress.add_task("", total=len(jobs), current="Starting...", events="0")
 
             for result in orc.run():
                 writer.write_events(result.events)
@@ -127,21 +203,30 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary, 
                 if result.error:
                     errors += 1
 
-                # Accumulate per-type counts
                 t = result.artifact_type
-                type_counts[t] = type_counts.get(t, 0) + result.event_count
+                if t not in type_t0:
+                    type_t0[t] = time.perf_counter()
+                type_done[t] = type_done.get(t, 0) + 1
+                type_evts[t] = type_evts.get(t, 0) + result.event_count
+                type_errs[t] = type_errs.get(t, 0) + (1 if result.error else 0)
+                type_counts[t] = type_evts[t]
 
-                # Per-artifact status line
-                status   = "[green]OK[/green]" if not result.error else "[red]ERR[/red]"
-                eps      = int(result.event_count / result.elapsed_secs) if result.elapsed_secs > 0 else 0
-                name     = os.path.basename(result.path)
-                progress.print(
-                    f"  {status} [cyan]{result.artifact_type:<10}[/cyan] "
-                    f"[white]{result.event_count:>8,}[/white] events  "
-                    f"[dim]{eps:>7,} ev/s  {result.elapsed_secs:.1f}s  {name}[/dim]"
+                # Print one summary line when all files of this type are done
+                if type_done[t] == type_totals[t]:
+                    elapsed = time.perf_counter() - type_t0[t]
+                    tag = "[red]ERR[/red]" if type_errs[t] else "[green] OK[/green]"
+                    progress.print(
+                        f"  {tag}  [cyan]{t:<10}[/cyan]  "
+                        f"[white]{type_evts[t]:>10,}[/white] events  "
+                        f"[dim]{elapsed:.1f}s[/dim]"
+                    )
+
+                progress.update(
+                    task,
+                    advance=1,
+                    current=t,
+                    events=f"{total_events:,}",
                 )
-
-                progress.update(task, advance=1, events=f"{total_events:,}")
 
     parse_elapsed = time.perf_counter() - parse_start
 
@@ -226,8 +311,8 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary, 
         console.print(f"[green]Sorted:[/green] {sorted_path} ({sort_elapsed:.1f}s)")
 
     # ── Summary ─────────────────────────────────────────────────────────────
-    total_elapsed = parse_elapsed + sort_elapsed
-    throughput = int(total_events / total_elapsed) if total_elapsed > 0 else 0
+    wall_elapsed = time.perf_counter() - wall_start
+    throughput   = int(total_events / parse_elapsed) if parse_elapsed > 0 else 0
 
     console.print()
     console.print(Panel(
@@ -235,7 +320,7 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary, 
         f"  Total events  : [cyan]{total_events:,}[/cyan]\n"
         f"  Parse time    : [cyan]{parse_elapsed:.1f}s[/cyan]\n"
         f"  Sort time     : [cyan]{sort_elapsed:.1f}s[/cyan]\n"
-        f"  Total time    : [bold cyan]{total_elapsed:.1f}s[/bold cyan]\n"
+        f"  Wall time     : [bold cyan]{wall_elapsed:.1f}s[/bold cyan]\n"
         f"  Throughput    : [cyan]{throughput:,} events/sec[/cyan]\n"
         f"  Output        : [white]{sorted_path}[/white]"
         + (f"\n  [yellow]Errors        : {errors}[/yellow]" if errors else ""),
@@ -243,7 +328,7 @@ def run(root_path, output, format, workers, no_sort, discover_only, no_summary, 
         title="Summary",
     ))
 
-    if not no_summary:
+    if debug:
         # Per-artifact-type aggregate table
         stbl = Table(title="Per-Artifact Summary")
         stbl.add_column("Type",     style="cyan")
