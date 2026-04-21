@@ -256,26 +256,55 @@ fn extract_utf16le_str(data: &[u8], start: usize, max_chars: usize) -> Option<St
     }
 }
 
+/// Return true if a string should be skipped when looking for meaningful content.
+fn is_noise_string(s: &str) -> bool {
+    // GUIDs: 36 chars, 4 hyphens
+    if s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4 {
+        return true;
+    }
+    // Provider / channel names
+    if s.starts_with("Microsoft-Windows-") || s.starts_with("Microsoft-")
+        || s.starts_with("PowerShell") || s.starts_with("Windows PowerShell")
+        || s.starts_with("http://") || s.starts_with("https://")
+    {
+        return true;
+    }
+    false
+}
+
+/// Measure a UTF-16LE string run starting at `start`.
+/// Returns (char_count, end_offset) where end_offset is the byte after the run.
+fn measure_utf16le_run(data: &[u8], start: usize) -> (usize, usize) {
+    let mut j = start;
+    let mut count = 0usize;
+    while j + 1 < data.len() {
+        let lo = data[j];
+        let hi = data[j + 1];
+        if hi != 0 || lo == 0 { break; }
+        if lo < 0x09 { break; } // non-printable control char
+        count += 1;
+        j += 2;
+    }
+    (count, j)
+}
+
 /// Scan raw event bytes for a UTF-16LE channel-like string.
-/// Tries known offsets first, then falls back to a broad scan.
+/// Steps byte-by-byte so odd-aligned strings (common in EVTX BinXML) are found.
 fn scan_for_channel(data: &[u8]) -> String {
-    // Scan in two windows: System section (0x18..0x18+400) for the channel literal
     let scan_end = data.len().min(0x18 + 600);
     let mut best: Option<String> = None;
-
     let mut i = 0x18;
     while i + 1 < scan_end {
         let lo = data[i];
         let hi = data[i + 1];
-        if hi != 0 || lo < 0x40 || lo > 0x7A {
-            i += 2;
+        // Only consider bytes that could start a letter in UTF-16LE (hi==0, lo is alpha)
+        if hi != 0 || !(lo.is_ascii_alphabetic()) {
+            i += 1;
             continue;
         }
-        // Potential start of a UTF-16LE string starting with a letter
-        if let Some(s) = extract_utf16le_str(data, i, 100) {
-            // Channel names are typically 4-80 chars
-            if s.len() >= 4 {
-                // Prefer well-known channel names
+        let (len, end) = measure_utf16le_run(data, i);
+        if len >= 4 {
+            if let Some(s) = extract_utf16le_str(data, i, 100) {
                 if s.starts_with("Security") || s.starts_with("System")
                     || s.starts_with("Application") || s.starts_with("Microsoft-")
                     || s.starts_with("Windows ") || s.starts_with("PowerShell")
@@ -283,55 +312,150 @@ fn scan_for_channel(data: &[u8]) -> String {
                 {
                     return s;
                 }
-                // Keep as a candidate if nothing better found
                 if best.is_none() || s.len() > best.as_ref().map_or(0, |b| b.len()) {
                     best = Some(s);
                 }
             }
+            i = end + 1; // step past this string (+ 1 for null terminator lo byte)
+        } else {
+            i += 1;
         }
-        i += 2;
     }
     best.unwrap_or_default()
 }
 
-/// For PowerShell EventID 4103/4104, extract a snippet of the script/payload text.
-/// The script block text is typically the longest UTF-16LE string in the EventData.
-fn extract_ps_snippet(data: &[u8]) -> Option<String> {
-    let mut best_start = 0usize;
-    let mut best_len = 0usize;
-    let scan_start = 0x18 + 0x5E + 50; // past the System section
+fn logon_type_name(t: u32) -> &'static str {
+    match t {
+        2  => "Interactive",
+        3  => "Network",
+        4  => "Batch",
+        5  => "Service",
+        7  => "Unlock",
+        8  => "NetworkCleartext",
+        9  => "NewCredentials",
+        10 => "RemoteInteractive",
+        11 => "CachedInteractive",
+        _  => "Unknown",
+    }
+}
+
+/// For logon/logoff events, extract the account name and logon type.
+/// BinXML value table layout for Security 4624:
+///   SubjectUserSid, SubjectUserName, SubjectDomainName, SubjectLogonId,
+///   TargetUserSid,  TargetUserName,  TargetDomainName,  TargetLogonId, LogonType, ...
+/// We skip SYSTEM/NT AUTHORITY so the first remaining UTF-16LE string is TargetUserName.
+fn extract_logon_snippet(data: &[u8]) -> Option<String> {
+    // Skip EVTX record header (0x18) + BinXML system values (~0xA8) + channel/computer strings
+    let scan_start = 0xC0usize.min(data.len());
+
+    static SKIP_ACCTS: &[&str] = &[
+        "SYSTEM", "-", "NT AUTHORITY", "ANONYMOUS LOGON",
+        "LOCAL SERVICE", "NETWORK SERVICE", "Window Manager", "DWM-1",
+    ];
+
+    // Collect UTF-16LE string candidates with their end-byte position
+    let mut candidates: Vec<(String, usize)> = Vec::new();
     let mut i = scan_start;
     while i + 1 < data.len() {
         let lo = data[i];
         let hi = data[i + 1];
-        if hi != 0 || lo < 0x09 {
-            i += 2;
+        if hi != 0 || !(lo.is_ascii_alphanumeric() || lo == b'_' || lo == b'-' || lo == b'.') {
+            i += 1;
             continue;
         }
-        // Measure run length
-        let start = i;
-        let mut j = i;
-        let mut length = 0usize;
-        while j + 1 < data.len() {
-            let l = data[j];
-            let h = data[j + 1];
-            if h != 0 || l == 0 { break; }
-            length += 1;
-            j += 2;
+        let (len, end) = measure_utf16le_run(data, i);
+        if len >= 2 && len <= 48 {
+            if let Some(s) = extract_utf16le_str(data, i, len) {
+                let skip = SKIP_ACCTS.iter().any(|n| s.eq_ignore_ascii_case(n))
+                    || s.starts_with("S-1-")
+                    || is_noise_string(&s)
+                    || s.contains('\\')
+                    || s.contains('/')
+                    || s.ends_with('$')
+                    || s.chars().any(|c| !c.is_ascii_alphanumeric() && !"._- @".contains(c));
+                if !skip {
+                    candidates.push((s, end));
+                }
+                i = end;
+                continue;
+            }
         }
-        if length > best_len {
-            best_len = length;
-            best_start = start;
+        i += 1;
+    }
+
+    // First candidate = TargetUserName (Subject names filtered as SYSTEM/NT AUTHORITY)
+    let (username, name_end) = candidates.into_iter().next()?;
+
+    // Scan for logon type: uint32 little-endian with value [2,11] and upper 2 bytes == 0
+    // Start just after where we found the username
+    let mut logon_type: Option<u32> = None;
+    let type_scan = name_end.min(data.len());
+    let mut j = type_scan;
+    while j + 4 <= data.len() {
+        let lo = u16::from_le_bytes([data[j], data[j + 1]]) as u32;
+        let hi = u16::from_le_bytes([data[j + 2], data[j + 3]]) as u32;
+        if lo >= 2 && lo <= 11 && hi == 0 {
+            logon_type = Some(lo);
+            break;
         }
-        i = j + 2;
+        j += 1;
     }
-    if best_len < 20 {
-        return None;
+
+    Some(match logon_type {
+        Some(t) => format!("Type {} ({}) | Account: {}", t, logon_type_name(t), username),
+        None    => format!("Account: {}", username),
+    })
+}
+
+/// For PowerShell EventID 4103/4104, find the script path (.ps1) or script snippet.
+/// Steps byte-by-byte to handle odd-aligned UTF-16LE strings in BinXML.
+fn extract_ps_snippet(data: &[u8]) -> Option<String> {
+    let mut ps1_path: Option<String> = None;
+    let mut best_start = 0usize;
+    let mut best_len  = 0usize;
+
+    let mut i = 0x18usize;
+    while i + 1 < data.len() {
+        let lo = data[i];
+        let hi = data[i + 1];
+        if hi != 0 || lo < 0x20 {
+            i += 1;
+            continue;
+        }
+        let (len, end) = measure_utf16le_run(data, i);
+        if len >= 10 {
+            if let Some(s) = extract_utf16le_str(data, i, len.min(300)) {
+                let sl = s.to_ascii_lowercase();
+                if sl.ends_with(".ps1") || sl.ends_with(".ps1\"") {
+                    // Script file path — most forensically useful
+                    if ps1_path.is_none() {
+                        ps1_path = Some(s);
+                    }
+                } else if !is_noise_string(&s) && len > best_len {
+                    best_len  = len;
+                    best_start = i;
+                }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
     }
-    let snippet_chars = best_len.min(200);
-    if let Some(s) = extract_utf16le_str(data, best_start, snippet_chars) {
-        if s.len() >= 20 {
-            return Some(s);
+
+    if let Some(path) = ps1_path {
+        let truncated = if path.len() > 200 { &path[..200] } else { &path };
+        return Some(format!("Script: {}", truncated));
+    }
+    if best_len >= 20 {
+        if let Some(s) = extract_utf16le_str(data, best_start, 200) {
+            if s.len() >= 20 {
+                let display = if s.len() > 160 {
+                    format!("{}...", &s[..160])
+                } else {
+                    s
+                };
+                return Some(display);
+            }
         }
     }
     None
@@ -391,15 +515,22 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
         None
     };
 
+    // For logon/logoff events, extract account name and logon type
+    let logon_snippet = match event_id {
+        4624 | 4625 | 4634 | 4647 | 4648 | 4672 | 4776 => extract_logon_snippet(data),
+        _ => None,
+    };
+
     let base = match (event_name(event_id), channel.is_empty()) {
         (Some(name), false) => format!("EventID {} - {} [{}]", event_id, name, channel),
         (Some(name), true)  => format!("EventID {} - {}", event_id, name),
         (None, false)       => format!("EventID {} [{}]", event_id, channel),
         (None, true)        => format!("EventID {}", event_id),
     };
-    let message = match ps_snippet {
-        Some(snippet) => format!("{} | {}", base, snippet),
-        None => base,
+    let message = if let Some(snippet) = ps_snippet.or(logon_snippet) {
+        format!("{} | {}", base, snippet)
+    } else {
+        base
     };
 
     Some(EvtxRecord {
