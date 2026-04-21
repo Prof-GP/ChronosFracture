@@ -4,3 +4,4 @@ pub mod evtx;
 pub mod prefetch;
 pub mod lnk;
 pub mod jumplists;
+pub(crate) mod read_helpers;

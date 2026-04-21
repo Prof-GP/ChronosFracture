@@ -6,41 +6,18 @@ use pyo3::types::{PyList, PyDict};
 
 use crate::types::TimelineEvent;
 use super::lnk::{parse_lnk_bytes_inner, events_from_lnk};
+use super::read_helpers::{r_u16, r_u32, r_u64, r_utf16_counted};
 
 // ── CFB (OLE Compound File Binary) constants ──────────────────────────────────
 
 const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 const ENDOFCHAIN: u32 = 0xFFFFFFFE;
-const FREESECT:   u32 = 0xFFFFFFFF;
-const FATSECT:    u32 = 0xFFFFFFFD;
 const DIFSECT:    u32 = 0xFFFFFFFC;
 
 // Directory entry object types
 const OBJ_STREAM:  u8 = 2;
 
-fn r_u16(d: &[u8], o: usize) -> u16 {
-    if o + 2 > d.len() { return 0; }
-    u16::from_le_bytes([d[o], d[o+1]])
-}
-fn r_u32(d: &[u8], o: usize) -> u32 {
-    if o + 4 > d.len() { return 0; }
-    u32::from_le_bytes([d[o], d[o+1], d[o+2], d[o+3]])
-}
-fn r_u64(d: &[u8], o: usize) -> u64 {
-    if o + 8 > d.len() { return 0; }
-    u64::from_le_bytes([d[o],d[o+1],d[o+2],d[o+3],d[o+4],d[o+5],d[o+6],d[o+7]])
-}
-fn r_utf16_counted(d: &[u8], off: usize, n: usize) -> String {
-    let end = (off + n * 2).min(d.len());
-    if off >= end { return String::new(); }
-    let pairs: Vec<u16> = d[off..end]
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .take_while(|&c| c != 0)
-        .collect();
-    String::from_utf16_lossy(&pairs).to_string()
-}
 
 // ── CFB reader ────────────────────────────────────────────────────────────────
 
@@ -99,8 +76,9 @@ impl<'a> Cfb<'a> {
             difat = r_u32(data, off + sector_size - 4);
         }
 
-        // Build FAT
-        let mut fat: Vec<u32> = Vec::with_capacity(num_fat_sectors as usize * (sector_size / 4));
+        // Build FAT — cap hint to prevent OOM on malformed input
+        let fat_cap = (num_fat_sectors as usize).min(4096) * (sector_size / 4);
+        let mut fat: Vec<u32> = Vec::with_capacity(fat_cap);
         for &s in &fat_sectors {
             let off = Self::sector_off_static(s, sector_size);
             if off + sector_size > data.len() { break; }
@@ -109,8 +87,9 @@ impl<'a> Cfb<'a> {
             }
         }
 
-        // Build mini FAT
-        let mut mini_fat: Vec<u32> = Vec::with_capacity(num_mini_fat_sectors as usize * (sector_size / 4));
+        // Build mini FAT — cap hint to prevent OOM on malformed input
+        let mini_fat_cap = (num_mini_fat_sectors as usize).min(4096) * (sector_size / 4);
+        let mut mini_fat: Vec<u32> = Vec::with_capacity(mini_fat_cap);
         let mut ms = first_mini_fat_sector;
         while ms < ENDOFCHAIN {
             let off = Self::sector_off_static(ms, sector_size);
@@ -135,10 +114,6 @@ impl<'a> Cfb<'a> {
 
     fn sector_off_static(sector: u32, sector_size: usize) -> usize {
         512 + sector as usize * sector_size
-    }
-
-    fn sector_off(&self, sector: u32) -> usize {
-        Self::sector_off_static(sector, self.sector_size)
     }
 
     fn read_chain_static(data: &[u8], start: u32, sector_size: usize, fat: &[u32]) -> Vec<u8> {
@@ -303,7 +278,7 @@ fn parse_destlist_scan(data: &[u8], artifact_path: &str, max_entries: usize) -> 
 
     while i + 8 < data.len() && events.len() < max_entries {
         let val = r_u64(data, i);
-        if val >= MIN_FT && val <= MAX_FT {
+        if (MIN_FT..=MAX_FT).contains(&val) {
             let ns = crate::types::filetime_to_unix_ns(val);
             // Scan up to 64 bytes after the FILETIME for a counted UTF-16LE string
             let scan_end = (i + 8 + 64).min(data.len().saturating_sub(2));

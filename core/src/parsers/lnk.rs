@@ -5,6 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::types::{TimelineEvent, filetime_to_unix_ns};
+use super::read_helpers::{r_u16, r_u32, r_u64, r_utf16_null, r_utf16_counted, r_ascii_null};
 
 // LNK header is always exactly 76 (0x4C) bytes
 const LNK_HEADER_LEN: usize = 76;
@@ -16,13 +17,11 @@ const LNK_CLSID: [u8; 16] = [
 ];
 
 // LinkFlags (offset 0x14 in header)
-const FL_HAS_ID_LIST:      u32 = 0x0001;
-const FL_HAS_LINK_INFO:    u32 = 0x0002;
-const FL_HAS_NAME:         u32 = 0x0004;
-const FL_HAS_REL_PATH:     u32 = 0x0008;
-const FL_HAS_WORKING_DIR:  u32 = 0x0010;
-const FL_HAS_ARGUMENTS:    u32 = 0x0020;
-const FL_IS_UNICODE:       u32 = 0x0080;
+const FL_HAS_ID_LIST:   u32 = 0x0001;
+const FL_HAS_LINK_INFO: u32 = 0x0002;
+const FL_HAS_NAME:      u32 = 0x0004;
+const FL_HAS_REL_PATH:  u32 = 0x0008;
+const FL_IS_UNICODE:    u32 = 0x0080;
 
 fn drive_type_str(t: u32) -> &'static str {
     match t {
@@ -35,55 +34,17 @@ fn drive_type_str(t: u32) -> &'static str {
     }
 }
 
-fn r_u16(d: &[u8], o: usize) -> u16 {
-    if o + 2 > d.len() { return 0; }
-    u16::from_le_bytes([d[o], d[o + 1]])
-}
-fn r_u32(d: &[u8], o: usize) -> u32 {
-    if o + 4 > d.len() { return 0; }
-    u32::from_le_bytes([d[o], d[o+1], d[o+2], d[o+3]])
-}
-fn r_u64(d: &[u8], o: usize) -> u64 {
-    if o + 8 > d.len() { return 0; }
-    u64::from_le_bytes([d[o],d[o+1],d[o+2],d[o+3],d[o+4],d[o+5],d[o+6],d[o+7]])
-}
-fn r_utf16_null(d: &[u8], off: usize) -> String {
-    let mut units = Vec::new();
-    let mut i = off;
-    while i + 1 < d.len() {
-        let c = u16::from_le_bytes([d[i], d[i+1]]);
-        if c == 0 { break; }
-        units.push(c);
-        i += 2;
-        if units.len() > 512 { break; }
-    }
-    String::from_utf16_lossy(&units).to_string()
-}
-fn r_utf16_counted(d: &[u8], off: usize, n: usize) -> String {
-    let end = (off + n * 2).min(d.len());
-    if off >= end { return String::new(); }
-    let pairs: Vec<u16> = d[off..end]
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect();
-    String::from_utf16_lossy(&pairs).to_string()
-}
-fn r_ascii_null(d: &[u8], off: usize) -> String {
-    let n = d[off..].iter().take(512).position(|&b| b == 0).unwrap_or(512);
-    String::from_utf8_lossy(&d[off..off + n]).to_string()
-}
-
-pub struct LnkParsed {
-    pub target_path:    String,
-    pub drive_type:     u32,
-    pub drive_serial:   u32,
-    pub volume_label:   String,
+pub(crate) struct LnkParsed {
+    pub(crate) target_path:  String,
+    pub(crate) drive_type:   u32,
+    pub(crate) drive_serial: u32,
+    pub(crate) volume_label: String,
     /// Embedded target FILETIME values: (creation, access, write)
-    pub target_times:   (u64, u64, u64),
+    pub(crate) target_times: (u64, u64, u64),
 }
 
 /// Parse raw LNK bytes.  Returns None if data is not a valid Shell Link file.
-pub fn parse_lnk_bytes_inner(data: &[u8]) -> Option<LnkParsed> {
+pub(crate) fn parse_lnk_bytes_inner(data: &[u8]) -> Option<LnkParsed> {
     if data.len() < LNK_HEADER_LEN { return None; }
     if r_u32(data, 0x00) != 0x4C { return None; }
     if data[0x04..0x14] != LNK_CLSID { return None; }
@@ -186,7 +147,7 @@ pub fn parse_lnk_bytes_inner(data: &[u8]) -> Option<LnkParsed> {
     })
 }
 
-pub fn events_from_lnk(parsed: LnkParsed, lnk_path: &str) -> Vec<TimelineEvent> {
+pub(crate) fn events_from_lnk(parsed: LnkParsed, lnk_path: &str) -> Vec<TimelineEvent> {
     let (create_ft, access_ft, write_ft) = parsed.target_times;
 
     // Nothing useful if no timestamps and no path
@@ -277,7 +238,8 @@ pub fn parse_lnk_bytes(py: Python<'_>, data: &[u8], lnk_path: &str) -> PyResult<
     Ok(list.into())
 }
 
-/// Walk a directory for *.lnk files, parse all in parallel.
+/// Parse all *.lnk files in a single directory (non-recursive). Jump lists and
+/// subdirectories are handled by the Python glue layer via parse_jumplist_bytes.
 #[pyfunction]
 pub fn parse_lnk_dir(py: Python<'_>, dir_path: &str) -> PyResult<Py<PyList>> {
     let paths: Vec<_> = fs::read_dir(Path::new(dir_path))

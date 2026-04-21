@@ -107,8 +107,10 @@ When `$UsnJrnl:$J` has been wiped, use `--recover-usnjrnl` to carve remnant USN 
 | `$UsnJrnl:$J` | Rust, 64MB parallel chunks | 1 per change record |
 | Windows Event Logs (`.evtx`) | Rust, 64KB parallel chunks | 1 per event |
 | Prefetch (`.pf`) | Rust, parallel per-file | Up to 8 last-run times |
+| LNK / Jump Lists | Rust + Python glue | 3 per `.lnk`; 1 per Jump List entry |
 | Registry hives | Python | 1 per key (last-written time) |
 | SRUM (`SRUDB.dat`) | Python | 1 per record |
+| Amcache (`Amcache.hve`) | Python | 1 per entry |
 
 ---
 

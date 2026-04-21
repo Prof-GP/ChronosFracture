@@ -88,16 +88,14 @@ fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord>
     let mut last_run_times = Vec::new();
 
     match version {
-        0x11 => { // V17 - XP/2003
-            if data.len() > 80 {
-                last_run_times.push(read_u64_le(data, 80));
-            }
+        0x11 if data.len() > 80 => { // V17 - XP/2003
+            last_run_times.push(read_u64_le(data, 80));
         }
-        0x17 => { // V23 - Vista/7
-            if data.len() > 0x78 + 8 {
-                last_run_times.push(read_u64_le(data, 0x78));
-            }
+        0x11 => {}
+        0x17 if data.len() > 0x78 + 8 => { // V23 - Vista/7
+            last_run_times.push(read_u64_le(data, 0x78));
         }
+        0x17 => {}
         0x1A | 0x1E => { // V26/V30 - Win8/10 - up to 8 run times
             let base = if version == 0x1A { 0x80 } else { 0x80 };
             for i in 0..8usize {

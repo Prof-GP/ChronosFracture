@@ -364,7 +364,7 @@ fn extract_logon_snippet(data: &[u8]) -> Option<String> {
             continue;
         }
         let (len, end) = measure_utf16le_run(data, i);
-        if len >= 2 && len <= 48 {
+        if (2..=48).contains(&len) {
             if let Some(s) = extract_utf16le_str(data, i, len) {
                 let skip = SKIP_ACCTS.iter().any(|n| s.eq_ignore_ascii_case(n))
                     || s.starts_with("S-1-")
@@ -394,7 +394,7 @@ fn extract_logon_snippet(data: &[u8]) -> Option<String> {
     while j + 4 <= data.len() {
         let lo = u16::from_le_bytes([data[j], data[j + 1]]) as u32;
         let hi = u16::from_le_bytes([data[j + 2], data[j + 3]]) as u32;
-        if lo >= 2 && lo <= 11 && hi == 0 {
+        if (2..=11).contains(&lo) && hi == 0 {
             logon_type = Some(lo);
             break;
         }
@@ -486,7 +486,6 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
     let xml_data = &data[0x18..];
 
     let mut event_id: u32 = 0;
-    let mut channel = String::new();
     let computer = String::new();
     let level: u8 = 0;
 
@@ -506,7 +505,7 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
         }
     }
 
-    channel = scan_for_channel(data);
+    let channel = scan_for_channel(data);
 
     // For PowerShell script block events, extract a snippet of the command
     let ps_snippet = if event_id == 4103 || event_id == 4104 {
@@ -586,7 +585,7 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
         }
 
         let rec_size = read_u32_le(chunk, offset + 4) as usize;
-        if rec_size < 24 || rec_size > EVTX_CHUNK_SIZE || offset + rec_size > chunk.len() {
+        if !(24..=EVTX_CHUNK_SIZE).contains(&rec_size) || offset + rec_size > chunk.len() {
             offset += 4;
             continue;
         }

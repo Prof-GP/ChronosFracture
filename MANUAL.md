@@ -48,10 +48,12 @@ supertimeline/
 ├── core/                   ← Rust library (compiled to .pyd / .so)
 │   └── src/
 │       ├── parsers/
-│       │   ├── mft.rs      ← $MFT parser    (rayon parallel, mmap)
-│       │   ├── usnjrnl.rs  ← $UsnJrnl:$J   (parallel 64MB chunks)
-│       │   ├── evtx.rs     ← EVTx logs      (parallel 64KB chunks)
-│       │   └── prefetch.rs ← .pf files      (parallel per-file)
+│       │   ├── mft.rs        ← $MFT parser    (rayon parallel, mmap)
+│       │   ├── usnjrnl.rs    ← $UsnJrnl:$J   (parallel 64MB chunks)
+│       │   ├── evtx.rs       ← EVTx logs      (parallel 64KB chunks)
+│       │   ├── prefetch.rs   ← .pf files      (parallel per-file)
+│       │   ├── lnk.rs        ← LNK Shell Link parser
+│       │   └── jumplists.rs  ← Jump List parser (CFB/OLE + DestList)
 │       ├── storage/
 │       │   └── arrow_writer.rs  ← Parquet streaming writer
 │       └── types.rs        ← TimelineEvent struct, FILETIME conversion
@@ -67,6 +69,7 @@ supertimeline/
 │       │   ├── amcache.py          ← Amcache.hve parser (pure Python)
 │       │   ├── logfile.py          ← $LogFile parser (pure Python)
 │       │   ├── prefetch.py         ← Prefetch glue: MAM decompress → Rust
+│       │   ├── lnk.py              ← LNK/JumpList glue: walk Recent/ → Rust
 │       │   └── usnjrnl_recover.py  ← USN journal carver (zeroed/unallocated)
 │       └── storage/
 │           └── writer.py   ← Streaming Parquet/JSONL/CSV writer
@@ -95,6 +98,7 @@ Disk Image / Volume
    │  Thread 4: Registry  → Python parser │
    │  Thread 5: SRUM      → Python parser │
    │  Thread 6: Amcache   → Python parser │
+   │  Thread 7: LNK/JL    → Rust parser   │
    └────────────────────────────────────┘
         │
         ▼  (streaming as each parser completes)
@@ -243,7 +247,7 @@ supertimeline C:\Cases\Case001\artifacts\ -o case001.parquet
 | **EVTx parsing** (50 GB) | 60–180 min | **8–15 min** | ~12x | Rust + per-chunk parallel dispatch |
 | **Registry parsing** | 30–90 min | **3–8 min** | ~11x | Python parallel hive walk |
 | **Prefetch parsing** | 15–30 min | **2–3 min** | ~10x | Rust + parallel per-file |
-| **LNK / Jump Lists** | 10–20 min | **1–2 min** | ~10x | Compiled parsers |
+| **LNK / Jump Lists** | 10–20 min | **1–2 min** | ~10x | Rust parsers + Python glue |
 | **SRUM / Amcache** | 20–40 min | **3–5 min** | ~8x | Python + pyesedb |
 | **Sort + output write** | 30–90 min | **3–8 min** | ~12x | Arrow columnar sort (in-stream) |
 | **Total wall clock** | **~6–9 hours** | **~25–53 min** | **~10x** | |
@@ -475,10 +479,24 @@ in parallel. For a directory of 50 GB of event logs:
 | `timestamp_iso` | Event creation time (UTC, nanosecond precision) |
 | `event_id` | Windows Event ID |
 | `channel` | Log channel (Security, System, Application, etc.) |
-| `message` | EventID + channel summary |
+| `message` | EventID + channel summary + inline snippet (see below) |
 
-**Note:** Full XML rendering of every event (as plaso does) adds significant overhead.
-supertimeline extracts the forensically critical fields. Full XML rendering is planned for v0.2.
+**Inline event snippets:** High-value event IDs include additional context appended to the message:
+
+| Event ID | Snippet added |
+|---|---|
+| 4624, 4625 | `Type N (TypeName) \| Account: username` — logon type and target account |
+| 4634, 4647, 4672 | `Account: username` — account name |
+| 4103, 4104 | `Script: C:\path\to\script.ps1` or script content excerpt (PowerShell script block logging) |
+
+Examples:
+```
+EventID 4624 - Logon [Security] | Type 3 (Network) | Account: jdoe
+EventID 4625 - Failed Logon [Security] | Type 3 (Network) | Account: Administrator
+EventID 4104 - PowerShell ScriptBlock [PowerShell] | Script: C:\Users\user\Desktop\payload.ps1
+```
+
+Snippet extraction uses byte-by-byte UTF-16LE scanning of BinXML records, handling odd-aligned strings common in Security and PowerShell event logs.
 
 ---
 
@@ -561,6 +579,47 @@ pip install "supertimeline[linux]"     # Linux
 
 ---
 
+### 7.7 LNK / Jump List Parser (`core/src/parsers/lnk.rs`, `core/src/parsers/jumplists.rs`)
+
+**What it parses:**
+- Windows Shell Link files (`*.lnk`) from `%APPDATA%\Microsoft\Windows\Recent\`
+- Automatic Jump Lists (`*.automaticDestinations-ms`) — OLE/CFB compound documents
+- Custom Jump Lists (`*.customDestinations-ms`) — flat concatenated LNK records
+
+**Why not redundant with MFT:** LNK files embed the target file's MAC timestamps and path at the time of last access. This provides:
+- Evidence of deleted file access (LNK survives after the target is gone)
+- User-initiated file opening events (distinct from filesystem operations)
+- Removable media tracking (volume serial + drive type embedded in LNK)
+- Application-file associations (Jump Lists are per-application)
+- MFT inode reuse detection (LNK stores MFT reference number)
+
+**Timestamps extracted per LNK file:**
+
+| Event | MACB | Source |
+|---|---|---|
+| Target file created | B | Embedded FILETIME in LNK header |
+| Target file last accessed | A | Embedded FILETIME in LNK header |
+| Target file last modified | M | Embedded FILETIME in LNK header |
+
+**Jump List DestList events:**
+
+`automaticDestinations` files contain a `DestList` stream with per-entry access times. These produce `source=JUMPLIST` events with the actual time the user last accessed the file via that application.
+
+**Sample output:**
+```
+2025-04-15T00:51:42Z [B] LNK | LNK target born: C:\Users\user\Documents\report.docx [Fixed A1B2C3D4]
+2025-04-18T15:17:08Z [A] LNK | LNK target last accessed: C:\Users\user\Documents\report.docx [Fixed A1B2C3D4]
+2025-04-18T15:17:08Z [A] JUMPLIST | JumpList accessed: C:\Users\user\Documents\report.docx
+```
+
+**Drive type flags in message:** `[Removable SERIAL]`, `[Fixed SERIAL; vol:LABEL]`, `[Network SERIAL]` — useful for detecting USB device use.
+
+**Image extraction:** Per-user `Recent/` directories are automatically extracted from disk images. Output is organized as `Recent/<username>/` in the temp directory.
+
+**Performance:** Rust parser processes LNK files in parallel. Typical `Recent/` directory (500–2000 files) → < 1 second.
+
+---
+
 ## 8. Output Formats
 
 ### 8.1 Parquet (default — recommended)
@@ -639,6 +698,8 @@ All timestamps are preserved at their native precision:
 | EVTx FILETIME | 100 nanoseconds | nanoseconds (int64) |
 | Registry FILETIME | 100 nanoseconds | nanoseconds (int64) |
 | Prefetch FILETIME | 100 nanoseconds | nanoseconds (int64) |
+| LNK embedded FILETIME | 100 nanoseconds | nanoseconds (int64) |
+| Jump List DestList FILETIME | 100 nanoseconds | nanoseconds (int64) |
 | SRUM OLE Date | ~1 second (float64) | nanoseconds (int64) |
 
 No precision is lost at any stage. The ISO string representation includes 9 decimal places:
@@ -767,7 +828,7 @@ HDD sequential read speed (~150 MB/s) bottlenecks I/O-bound phases.
 | Registry | ✅ | ✅ |
 | SRUM | ✅ | ✅ |
 | Amcache | ✅ | ✅ |
-| LNK / Jump Lists | ✅ | 🔜 v0.2 |
+| LNK / Jump Lists | ✅ | ✅ |
 | Browser history | ✅ | 🔜 v0.2 |
 | $LogFile | ✅ | ✅ |
 | macOS artifacts | ✅ | ❌ (Windows-focused) |
@@ -782,3 +843,7 @@ HDD sequential read speed (~150 MB/s) bottlenecks I/O-bound phases.
 ---
 
 *supertimeline v0.1.0 — Built for forensic analysts who cannot afford to wait.*
+
+---
+
+*Parsers: $MFT · $UsnJrnl · EVTx · Prefetch · LNK / Jump Lists · Registry · SRUM · Amcache · $LogFile*

@@ -214,34 +214,32 @@ fn parse_mft_entry(entry: &[u8], entry_index: u64, artifact_path: &str) -> Vec<T
             let data_start = attr_offset + content_off;
 
             match attr_type {
-                ATTR_STANDARD_INFORMATION => {
-                    if content_len >= 32 && data_start + 32 <= MFT_ENTRY_SIZE {
-                        si_timestamps = Some([
-                            read_u64_le(entry, data_start),      // created
-                            read_u64_le(entry, data_start + 8),  // modified
-                            read_u64_le(entry, data_start + 16), // mft modified
-                            read_u64_le(entry, data_start + 24), // accessed
+                ATTR_STANDARD_INFORMATION if content_len >= 32 && data_start + 32 <= MFT_ENTRY_SIZE => {
+                    si_timestamps = Some([
+                        read_u64_le(entry, data_start),      // created
+                        read_u64_le(entry, data_start + 8),  // modified
+                        read_u64_le(entry, data_start + 16), // mft modified
+                        read_u64_le(entry, data_start + 24), // accessed
+                    ]);
+                }
+                ATTR_STANDARD_INFORMATION => {}
+                ATTR_FILE_NAME if content_len >= 66 && data_start + 66 <= MFT_ENTRY_SIZE => {
+                    let name_len = entry[data_start + 64] as usize;
+                    let namespace = entry[data_start + 65];
+                    // Prefer POSIX (0) or Win32 (1) namespaces over DOS (2) or Win32&DOS (3)
+                    if namespace != 2 {
+                        if data_start + 66 + name_len * 2 <= MFT_ENTRY_SIZE {
+                            file_name = parse_utf16_name(entry, data_start + 66, name_len);
+                        }
+                        fn_timestamps = Some([
+                            read_u64_le(entry, data_start + 8),  // created
+                            read_u64_le(entry, data_start + 16), // modified
+                            read_u64_le(entry, data_start + 24), // mft modified
+                            read_u64_le(entry, data_start + 32), // accessed
                         ]);
                     }
                 }
-                ATTR_FILE_NAME => {
-                    if content_len >= 66 && data_start + 66 <= MFT_ENTRY_SIZE {
-                        let name_len = entry[data_start + 64] as usize;
-                        let namespace = entry[data_start + 65];
-                        // Prefer POSIX (0) or Win32 (1) namespaces over DOS (2) or Win32&DOS (3)
-                        if namespace != 2 {
-                            if data_start + 66 + name_len * 2 <= MFT_ENTRY_SIZE {
-                                file_name = parse_utf16_name(entry, data_start + 66, name_len);
-                            }
-                            fn_timestamps = Some([
-                                read_u64_le(entry, data_start + 8),  // created
-                                read_u64_le(entry, data_start + 16), // modified
-                                read_u64_le(entry, data_start + 24), // mft modified
-                                read_u64_le(entry, data_start + 32), // accessed
-                            ]);
-                        }
-                    }
-                }
+                ATTR_FILE_NAME => {}
                 _ => {}
             }
         }
