@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use rayon::prelude::*;
 
-use crate::types::{TimelineEvent, filetime_to_unix_ns};
+use crate::types::{TimelineEvent, EventExtra, filetime_to_unix_ns};
 use crate::utils::lzxpress;
 
 // Prefetch version bytes — retained as named constants for format documentation
@@ -133,12 +133,12 @@ fn events_from_record(rec: PrefetchRecord, path_str: &str) -> Vec<TimelineEvent>
             tz_offset_secs:  0,
             is_fn_timestamp: false,
             source_hash:     None,
-            extra:           Some(serde_json::json!({
-                "exe_name":       rec.exe_name,
-                "run_count":      rec.run_count,
-                "prefetch_hash":  format!("{:08X}", rec.hash),
-                "version":        rec.version,
-            })),
+            extra: Some(EventExtra::Prefetch {
+                exe_name:      rec.exe_name.clone(),
+                run_count:     rec.run_count,
+                prefetch_hash: format!("{:08X}", rec.hash),
+                version:       rec.version as u32,
+            }),
         })
         .collect()
 }
@@ -197,9 +197,9 @@ pub fn parse_prefetch_bytes_decompressed(
         dict.set_item("message",         &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
-        if let Some(extra) = &ev.extra {
-            dict.set_item("exe_name",   extra["exe_name"].as_str().unwrap_or(""))?;
-            dict.set_item("run_count",  extra["run_count"].as_u64().unwrap_or(0))?;
+        if let Some(EventExtra::Prefetch { exe_name, run_count, .. }) = &ev.extra {
+            dict.set_item("exe_name",  exe_name.as_str())?;
+            dict.set_item("run_count", run_count)?;
         }
         list.append(dict)?;
     }
@@ -240,9 +240,9 @@ pub fn parse_prefetch_dir(py: Python<'_>, dir_path: &str) -> PyResult<Py<PyList>
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;
-        if let Some(extra) = &ev.extra {
-            dict.set_item("exe_name", extra["exe_name"].as_str().unwrap_or(""))?;
-            dict.set_item("run_count", extra["run_count"].as_u64().unwrap_or(0))?;
+        if let Some(EventExtra::Prefetch { exe_name, run_count, .. }) = &ev.extra {
+            dict.set_item("exe_name",  exe_name.as_str())?;
+            dict.set_item("run_count", run_count)?;
         }
         list.append(dict)?;
     }

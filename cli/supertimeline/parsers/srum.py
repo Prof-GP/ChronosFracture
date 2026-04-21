@@ -11,6 +11,7 @@ Tables parsed:
 from __future__ import annotations
 
 import logging
+import struct
 from typing import List, Dict, Any, Optional
 
 log = logging.getLogger(__name__)
@@ -46,7 +47,6 @@ _OLE_UNIX_EPOCH_DAYS = 25569.0
 
 def _ole_date_to_unix_ns(raw: bytes) -> int:
     """Convert 8-byte little-endian OLE Automation Date to Unix nanoseconds."""
-    import struct
     if len(raw) != 8:
         return 0
     ole_days = struct.unpack("<d", raw)[0]
@@ -73,7 +73,6 @@ def _timestamp_val(record, idx: int, col_types: Dict[int, int]) -> int:
     if col_types.get(idx) == _ESE_COLTYPE_DATETIME:
         return _ole_date_to_unix_ns(raw)
     # Fall back: treat as little-endian FILETIME integer
-    import struct
     from supertimeline.utils.timestamps import filetime_to_unix_ns
     try:
         ft = struct.unpack("<Q", raw)[0]
@@ -131,7 +130,6 @@ def _float_val(record, idx: int) -> Optional[float]:
         raw = record.get_value_data(idx)
         if raw is None:
             return None
-        import struct
         if len(raw) == 8:
             return struct.unpack("<d", raw)[0]
         if len(raw) == 4:

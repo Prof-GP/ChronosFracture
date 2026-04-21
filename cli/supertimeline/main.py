@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import click
+from collections import defaultdict
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
@@ -149,7 +150,6 @@ def run(root_path, output, format, workers, no_sort, discover_only, debug, recov
         sys.exit(1)
 
     # Compact discovery summary — one row per type, not per file
-    from collections import defaultdict
     type_summary: dict = defaultdict(lambda: {"count": 0, "size_mb": 0.0})
     for job in jobs:
         type_summary[job.artifact_type]["count"]   += 1
@@ -159,8 +159,8 @@ def run(root_path, output, format, workers, no_sort, discover_only, debug, recov
     tbl.add_column("Type",   style="cyan",  no_wrap=True)
     tbl.add_column("Files",  style="white", justify="right")
     tbl.add_column("Size",   style="green", justify="right")
-    for atype, info in sorted(type_summary.items()):
-        tbl.add_row(atype, str(info["count"]), f"{info['size_mb']:.1f} MB")
+    for atype, summary in sorted(type_summary.items()):
+        tbl.add_row(atype, str(summary["count"]), f"{summary['size_mb']:.1f} MB")
     console.print(tbl)
 
     if discover_only:
@@ -175,7 +175,6 @@ def run(root_path, output, format, workers, no_sort, discover_only, debug, recov
     type_counts: dict = {}
 
     # Pre-count files per type so we know when a section is fully done
-    from collections import defaultdict as _dd
     type_totals:  dict = {}
     for job in jobs:
         type_totals[job.artifact_type] = type_totals.get(job.artifact_type, 0) + 1
@@ -242,7 +241,7 @@ def run(root_path, output, format, workers, no_sort, discover_only, debug, recov
         )
 
         usnjrnl_live_events = sum(
-            r.event_count for r in orc._results if r.artifact_type == "USNJRNL"
+            r.event_count for r in orc.results if r.artifact_type == "USNJRNL"
         )
 
         # 1. Scan zeroed $J — triggered when $J existed on image but live parse

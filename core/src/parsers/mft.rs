@@ -158,7 +158,7 @@ fn build_macb_events(
                 tz_offset_secs: 0,
                 is_fn_timestamp: is_fn,
                 source_hash: None,
-                extra: Some(serde_json::json!({ "mft_entry": entry_index })),
+                extra: Some(crate::types::EventExtra::Mft { mft_entry: entry_index }),
             }
         })
         .collect()

@@ -4,7 +4,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyDict};
 
-use crate::types::TimelineEvent;
+use crate::types::{TimelineEvent, EventExtra};
 use super::lnk::{parse_lnk_bytes_inner, events_from_lnk};
 use super::read_helpers::{r_u16, r_u32, r_u64, r_utf16_counted};
 
@@ -253,10 +253,10 @@ fn parse_destlist(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
                 tz_offset_secs:  0,
                 is_fn_timestamp: false,
                 source_hash:     None,
-                extra:           Some(serde_json::json!({
-                    "target_path":       &target,
-                    "destlist_version":  version,
-                })),
+                extra: Some(EventExtra::JumpList {
+                    target_path:      target.clone(),
+                    destlist_version: Some(version),
+                }),
             });
         }
 
@@ -298,7 +298,10 @@ fn parse_destlist_scan(data: &[u8], artifact_path: &str, max_entries: usize) -> 
                             tz_offset_secs:  0,
                             is_fn_timestamp: false,
                             source_hash:     None,
-                            extra:           Some(serde_json::json!({"target_path": &s})),
+                            extra: Some(EventExtra::JumpList {
+                                target_path:      s.clone(),
+                                destlist_version: None,
+                            }),
                         });
                         i = k + 2 + len * 2;
                         break;
@@ -380,11 +383,11 @@ fn event_to_dict<'py>(py: Python<'py>, ev: &TimelineEvent) -> PyResult<Bound<'py
     d.set_item("message",         &ev.message)?;
     d.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
     d.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
-    if let Some(x) = &ev.extra {
-        d.set_item("target_path",  x["target_path"].as_str().unwrap_or(""))?;
-        d.set_item("drive_type",   x["drive_type"].as_u64().unwrap_or(0))?;
-        d.set_item("drive_serial", x["drive_serial"].as_str().unwrap_or(""))?;
-        d.set_item("volume_label", x["volume_label"].as_str().unwrap_or(""))?;
+    if let Some(EventExtra::JumpList { target_path, destlist_version }) = &ev.extra {
+        d.set_item("target_path", target_path.as_str())?;
+        if let Some(v) = destlist_version {
+            d.set_item("destlist_version", v)?;
+        }
     }
     Ok(d)
 }

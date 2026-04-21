@@ -4,7 +4,8 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
 
-use crate::types::{TimelineEvent, filetime_to_unix_ns};
+use crate::types::{TimelineEvent, EventExtra, filetime_to_unix_ns};
+use super::read_helpers::{r_u16, r_u32, r_u64};
 
 // EVTX file header magic
 const EVTX_MAGIC: &[u8; 8] = b"ElfFile\x00";
@@ -29,20 +30,6 @@ const TOKEN_NORMAL_SUB:   u8 = 0x0D;
 const TOKEN_OPT_SUB:      u8 = 0x0E;
 const TOKEN_END_OF_STREAM: u8 = 0x0F;
 
-fn read_u16_le(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([data[off], data[off+1]])
-}
-
-fn read_u32_le(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]])
-}
-
-fn read_u64_le(data: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes([
-        data[off], data[off+1], data[off+2], data[off+3],
-        data[off+4], data[off+5], data[off+6], data[off+7],
-    ])
-}
 
 /// Minimal EVTX event record extracted from a chunk
 #[derive(Debug, Clone)]
@@ -477,7 +464,7 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
         return None;
     }
 
-    let timestamp_ft = read_u64_le(data, 0x10);
+    let timestamp_ft = r_u64(data, 0x10);
     let timestamp_ns = filetime_to_unix_ns(timestamp_ft);
 
     // BinXML starts at offset 0x18
@@ -499,7 +486,7 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
     // we fall back to 0 rather than returning a wrong value.
     const EID_BINXML_OFFSET: usize = 0x5E; // = record offset 0x76 minus header 0x18
     if xml_data.len() > EID_BINXML_OFFSET + 2 {
-        let candidate = read_u16_le(xml_data, EID_BINXML_OFFSET) as u32;
+        let candidate = r_u16(xml_data, EID_BINXML_OFFSET) as u32;
         if candidate > 0 && candidate < 65536 {
             event_id = candidate;
         }
@@ -560,7 +547,7 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
     // assume event records begin exactly at 0x80.  Scan forward from 0x80
     // for the first event record magic "\x2a\x2a\x00\x00".
     let search_start = 0x80usize;
-    let last_record_off = read_u32_le(chunk, 0x2C) as usize;
+    let last_record_off = r_u32(chunk, 0x2C) as usize;
     let scan_end = if last_record_off > search_start && last_record_off < EVTX_CHUNK_SIZE {
         last_record_off + 4  // a bit past the last known record start
     } else {
@@ -584,7 +571,7 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
             continue;
         }
 
-        let rec_size = read_u32_le(chunk, offset + 4) as usize;
+        let rec_size = r_u32(chunk, offset + 4) as usize;
         if !(24..=EVTX_CHUNK_SIZE).contains(&rec_size) || offset + rec_size > chunk.len() {
             offset += 4;
             continue;
@@ -618,11 +605,11 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
                 tz_offset_secs: 0,
                 is_fn_timestamp: false,
                 source_hash: None,
-                extra: Some(serde_json::json!({
-                    "event_id": rec.event_id,
-                    "channel": rec.channel,
-                    "level": rec.level,
-                })),
+                extra: Some(EventExtra::Evtx {
+                    event_id: rec.event_id,
+                    channel:  rec.channel.clone(),
+                    level:    rec.level,
+                }),
             });
         }
 
@@ -671,9 +658,9 @@ pub fn parse_evtx_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;
-        if let Some(extra) = &ev.extra {
-            dict.set_item("event_id", extra["event_id"].as_u64().unwrap_or(0))?;
-            dict.set_item("channel", extra["channel"].as_str().unwrap_or(""))?;
+        if let Some(EventExtra::Evtx { event_id, channel, .. }) = &ev.extra {
+            dict.set_item("event_id", event_id)?;
+            dict.set_item("channel", channel.as_str())?;
         }
         list.append(dict)?;
     }

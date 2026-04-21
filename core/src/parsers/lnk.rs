@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use rayon::prelude::*;
 
-use crate::types::{TimelineEvent, filetime_to_unix_ns};
+use crate::types::{TimelineEvent, EventExtra, filetime_to_unix_ns};
 use super::read_helpers::{r_u16, r_u32, r_u64, r_utf16_null, r_utf16_counted, r_ascii_null};
 
 // LNK header is always exactly 76 (0x4C) bytes
@@ -187,12 +187,12 @@ pub(crate) fn events_from_lnk(parsed: LnkParsed, lnk_path: &str) -> Vec<Timeline
             tz_offset_secs:  0,
             is_fn_timestamp: false,
             source_hash:     None,
-            extra:           Some(serde_json::json!({
-                "target_path":   &parsed.target_path,
-                "drive_type":    parsed.drive_type,
-                "drive_serial":  format!("{:08X}", parsed.drive_serial),
-                "volume_label":  &parsed.volume_label,
-            })),
+            extra: Some(EventExtra::Lnk {
+                target_path:  parsed.target_path.clone(),
+                drive_type:   parsed.drive_type,
+                drive_serial: format!("{:08X}", parsed.drive_serial),
+                volume_label: parsed.volume_label.clone(),
+            }),
         })
     };
 
@@ -217,11 +217,11 @@ fn event_to_dict<'py>(py: Python<'py>, ev: &TimelineEvent) -> PyResult<Bound<'py
     d.set_item("message",         &ev.message)?;
     d.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
     d.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
-    if let Some(x) = &ev.extra {
-        d.set_item("target_path",  x["target_path"].as_str().unwrap_or(""))?;
-        d.set_item("drive_type",   x["drive_type"].as_u64().unwrap_or(0))?;
-        d.set_item("drive_serial", x["drive_serial"].as_str().unwrap_or(""))?;
-        d.set_item("volume_label", x["volume_label"].as_str().unwrap_or(""))?;
+    if let Some(EventExtra::Lnk { target_path, drive_type, drive_serial, volume_label }) = &ev.extra {
+        d.set_item("target_path",  target_path.as_str())?;
+        d.set_item("drive_type",   drive_type)?;
+        d.set_item("drive_serial", drive_serial.as_str())?;
+        d.set_item("volume_label", volume_label.as_str())?;
     }
     Ok(d)
 }

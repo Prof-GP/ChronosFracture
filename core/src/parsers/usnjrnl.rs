@@ -119,10 +119,10 @@ fn scan_usn_records(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
             tz_offset_secs: 0,
             is_fn_timestamp: false,
             source_hash: None,
-            extra: Some(serde_json::json!({
-                "reasons": reason_str,
-                "file_attributes": file_attrs,
-            })),
+            extra: Some(crate::types::EventExtra::Usn {
+                reasons:         reason_str.to_string(),
+                file_attributes: file_attrs,
+            }),
         });
 
         offset += rec_len;

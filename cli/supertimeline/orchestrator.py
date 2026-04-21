@@ -439,6 +439,10 @@ class Orchestrator:
         self.close()
 
     @property
+    def results(self) -> List[ParseResult]:
+        return list(self._results)
+
+    @property
     def total_events(self) -> int:
         return sum(r.event_count for r in self._results)
 
