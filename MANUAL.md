@@ -60,9 +60,14 @@ supertimeline/
 │   └── supertimeline/
 │       ├── main.py         ← Click CLI entry point
 │       ├── orchestrator.py ← Artifact discovery + parallel dispatch
+│       ├── image.py        ← E01/VMDK/VHD image mounting + extraction
 │       ├── parsers/
-│       │   ├── registry.py ← Registry hive parser (pure Python)
-│       │   └── srum.py     ← SRUM parser (pure Python)
+│       │   ├── registry.py         ← Registry hive parser (pure Python)
+│       │   ├── srum.py             ← SRUM / ESE database parser (pure Python)
+│       │   ├── amcache.py          ← Amcache.hve parser (pure Python)
+│       │   ├── logfile.py          ← $LogFile parser (pure Python)
+│       │   ├── prefetch.py         ← Prefetch glue: MAM decompress → Rust
+│       │   └── usnjrnl_recover.py  ← USN journal carver (zeroed/unallocated)
 │       └── storage/
 │           └── writer.py   ← Streaming Parquet/JSONL/CSV writer
 │
@@ -84,10 +89,12 @@ Disk Image / Volume
    ┌────┴────────────────────────────────┐
    │  ThreadPoolExecutor (N=CPU cores)   │
    │                                     │
-   │  Thread 1: $MFT     → Rust parser  │
-   │  Thread 2: EVTx ×N  → Rust parser  │
-   │  Thread 3: Prefetch → Rust parser  │
-   │  Thread 4: Registry → Python parser│
+   │  Thread 1: $MFT      → Rust parser   │
+   │  Thread 2: EVTx ×N   → Rust parser   │
+   │  Thread 3: Prefetch  → Rust parser   │
+   │  Thread 4: Registry  → Python parser │
+   │  Thread 5: SRUM      → Python parser │
+   │  Thread 6: Amcache   → Python parser │
    └────────────────────────────────────┘
         │
         ▼  (streaming as each parser completes)
@@ -112,17 +119,25 @@ Disk Image / Volume
 |---|---|---|
 | Python | 3.10+ | 3.12 recommended |
 | Rust | 1.75+ | `rustup install stable` |
+| MSVC Build Tools | 2019+ | **Windows only** — required by Rust MSVC toolchain |
 | RAM | 8 GB | 16 GB recommended for 1TB images |
 | Disk (output) | 10–50 GB | Parquet ~3–6 GB per 100M events |
 
-### Step 1 — Install Rust (if not already installed)
+### Step 1 — Install prerequisites (Windows)
 
+**Rust:**
 ```powershell
-# Windows (PowerShell)
 winget install Rustlang.Rustup
 # After install, restart terminal:
 rustup default stable
 ```
+
+**Visual Studio Build Tools** (required for Rust to compile native extensions):
+```powershell
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+If you already have Visual Studio installed, ensure the **Desktop development with C++** workload is selected.
 
 ### Step 2 — Create and activate a virtual environment
 
@@ -463,8 +478,7 @@ in parallel. For a directory of 50 GB of event logs:
 | `message` | EventID + channel summary |
 
 **Note:** Full XML rendering of every event (as plaso does) adds significant overhead.
-supertimeline extracts the forensically critical fields. Full XML can be added via the
-`--full-xml` flag (planned v0.2).
+supertimeline extracts the forensically critical fields. Full XML rendering is planned for v0.2.
 
 ---
 
@@ -485,8 +499,15 @@ supertimeline extracts the forensically critical fields. Full XML can be added v
 
 **Performance:** All .pf files parsed in parallel. Typical 200 files → < 1 second.
 
-> **Note:** Windows 10/11 compressed MAM prefetch (MAM magic) requires decompression
-> via Windows' built-in Xpress Huffman algorithm. Full support in v0.2.
+**MAM compression (Windows 10/11):** Compressed `.pf` files are decompressed automatically:
+- **Windows:** via `windowsprefetch` (uses ntdll `RtlDecompressBufferEx`)
+- **Linux:** via `pyscca` (libscca, handles MAM natively)
+
+Install the appropriate extra for your platform:
+```bash
+pip install "supertimeline[windows]"   # Windows
+pip install "supertimeline[linux]"     # Linux
+```
 
 ---
 
@@ -513,22 +534,30 @@ supertimeline extracts the forensically critical fields. Full XML can be added v
 
 ### 7.6 SRUM Parser (`cli/supertimeline/parsers/srum.py`)
 
-**What it parses:** `Windows\System32\sru\SRUDB.dat` (ESE database)
+**What it parses:** `Windows\System32\sru\SRUDB.dat` (ESE/JET database)
 
-**Timestamps extracted:** 1 per record (measurement time)
+**Timestamps extracted:** 1 per record (OLE Automation Date, converted to UTC nanoseconds)
 
-**Requires:** `pyesedb` library (optional; SRUM skipped if unavailable)
-
-```bash
-pip install libyal-python  # or build pyesedb from source
-```
+**Requires:** `libesedb-python` — installed automatically with `pip install .`
 
 **Tables parsed:**
 
-| Table GUID | Contents |
-|---|---|
-| D10CA2FE-... | Application resource usage (CPU, disk, network per-app) |
-| 973F5D5C-... | Network usage per application |
+| Table GUID | Artifact label | Contents |
+|---|---|---|
+| `{D10CA2FE-6FCF-4F6D-848E-B2E99266FA89}` | `SRUM AppTimeline` | CPU cycles (fg/bg), disk bytes read/written per app per hour |
+| `{973F5D5C-1D90-4944-BE8E-24B94231A174}` | `SRUM Network` | Bytes sent/received per app per hour |
+
+**ID resolution:** `SruDbIdMapTable` maps integer IDs to application paths and user SIDs.
+- `IdType=0/1` — UTF-16LE application path (auto-generated `!!exe!timestamp!hash` prefix stripped)
+- `IdType=3` — Binary Windows SID decoded to `S-1-5-...` string form
+
+**Sample output:**
+```
+2025-04-26T22:13:00 | SRUM AppTimeline | App: \Device\HarddiskVolume2\Windows\System32\svchost.exe | User: S-1-5-18 | fg_cycles=18,879,633 bg_cycles=0 fg_read=147,598,346B
+2025-04-26T22:11:00 | SRUM Network     | App: Dhcp | User: S-1-5-19 | sent=4,252B | recv=6,490B
+```
+
+**Performance:** Pure Python via `pyesedb`. Typical 6 MB SRUDB.dat → < 1 second.
 
 ---
 
@@ -610,6 +639,7 @@ All timestamps are preserved at their native precision:
 | EVTx FILETIME | 100 nanoseconds | nanoseconds (int64) |
 | Registry FILETIME | 100 nanoseconds | nanoseconds (int64) |
 | Prefetch FILETIME | 100 nanoseconds | nanoseconds (int64) |
+| SRUM OLE Date | ~1 second (float64) | nanoseconds (int64) |
 
 No precision is lost at any stage. The ISO string representation includes 9 decimal places:
 `2024-11-15T14:23:01.123456700Z`
@@ -680,11 +710,15 @@ error: could not compile `supertimeline-core`
 ```
 error: Microsoft Visual C++ is required
 ```
-**Fix (Windows):** Install Visual Studio Build Tools:
-```powershell
-winget install Microsoft.VisualStudio.2022.BuildTools
+or
 ```
-Then select "Desktop development with C++" workload.
+error: linker `link.exe` not found
+```
+**Fix (Windows):** Install Visual Studio Build Tools with the C++ workload:
+```powershell
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+Then restart your terminal and retry `pip install .`
 
 ---
 
@@ -731,10 +765,11 @@ HDD sequential read speed (~150 MB/s) bottlenecks I/O-bound phases.
 | EVTx | ✅ | ✅ |
 | Prefetch | ✅ | ✅ |
 | Registry | ✅ | ✅ |
-| SRUM | ✅ | ✅ (requires pyesedb) |
+| SRUM | ✅ | ✅ |
+| Amcache | ✅ | ✅ |
 | LNK / Jump Lists | ✅ | 🔜 v0.2 |
 | Browser history | ✅ | 🔜 v0.2 |
-| $LogFile | ✅ | 🔜 v0.2 |
+| $LogFile | ✅ | ✅ |
 | macOS artifacts | ✅ | ❌ (Windows-focused) |
 | Linux artifacts | ✅ | ❌ (Windows-focused) |
 | Timesketch output | ✅ | ✅ (JSONL) |

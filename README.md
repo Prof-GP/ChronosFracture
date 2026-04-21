@@ -18,11 +18,15 @@ High-performance forensic super-timeline generator for Windows disk images and l
 
 - [Python 3.10+](https://www.python.org/downloads/)
 - [Rust 1.75+](https://rustup.rs/)
+- **Windows only:** [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload — required by the Rust MSVC toolchain to compile the native extension.
 
 ```powershell
 # Windows — install Rust via winget
 winget install Rustlang.Rustup
 rustup default stable
+
+# Windows — install MSVC build tools via winget (if not already installed)
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
 ### Install
