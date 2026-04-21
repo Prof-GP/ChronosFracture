@@ -77,6 +77,9 @@ supertimeline run E:\ -o case001.parquet
 # JSONL output for Timesketch
 supertimeline run E:\ -o case001.jsonl -f jsonl
 
+# CSV output for spreadsheet analysis
+supertimeline run E:\ -o case001.csv -f csv
+
 # Explicit thread count
 supertimeline run E:\ -o case001.parquet -w 16
 

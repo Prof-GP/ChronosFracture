@@ -1,5 +1,5 @@
 # supertimeline — Forensic Super-Timeline Generator
-## Analyst Manual v0.1.0
+## Analyst Manual v1.0.0
 
 ---
 
@@ -67,6 +67,7 @@ supertimeline/
 │       │   ├── registry.py         ← Registry hive parser (pure Python)
 │       │   ├── srum.py             ← SRUM / ESE database parser (pure Python)
 │       │   ├── amcache.py          ← Amcache.hve parser (pure Python)
+│       │   ├── pcasvc.py           ← PcaSvc execution artifact parser (pure Python)
 │       │   ├── logfile.py          ← $LogFile parser (pure Python)
 │       │   ├── prefetch.py         ← Prefetch glue: MAM decompress → Rust
 │       │   ├── lnk.py              ← LNK/JumpList glue: walk Recent/ → Rust
@@ -99,6 +100,7 @@ Disk Image / Volume
    │  Thread 5: SRUM      → Python parser │
    │  Thread 6: Amcache   → Python parser │
    │  Thread 7: LNK/JL    → Rust parser   │
+   │  Thread 8: PcaSvc    → Python parser │
    └────────────────────────────────────┘
         │
         ▼  (streaming as each parser completes)
@@ -188,6 +190,9 @@ supertimeline E:\ -o case001.parquet -w 16
 
 # JSONL output (for direct Timesketch import)
 supertimeline E:\ -o case001.jsonl -f jsonl
+
+# CSV output (for spreadsheet / Excel analysis)
+supertimeline E:\ -o case001.csv -f csv
 ```
 
 ### Discover artifacts without parsing
@@ -620,6 +625,48 @@ pip install "supertimeline[linux]"     # Linux
 
 ---
 
+### 7.8 PcaSvc Parser (`cli/supertimeline/parsers/pcasvc.py`)
+
+**What it parses:** Program Compatibility Assistant Service execution logs (Windows 11 22H2+)
+
+**Timestamps extracted:** 1 per execution record
+
+**Files parsed:**
+
+| File | Encoding | Format |
+|---|---|---|
+| `PcaAppLaunchDic.txt` | ANSI CP-1252 | `exe_path\|UTC_timestamp` (2 fields) |
+| `PcaGeneralDb0.txt` | UTF-16LE | 8 pipe-delimited fields |
+| `PcaGeneralDb1.txt` | UTF-16LE | Same format as `PcaGeneralDb0.txt` (rotated backup) |
+
+**Location:** `Windows\appcompat\pca\`
+
+**Key limitations:**
+- Only captures **GUI-launched executables** (Explorer, RDP sessions, downloads, installers)
+- Does **not** capture command-line, PowerShell, WMI, or scheduled-task execution
+- Paths are lowercased and may contain partial redactions (`%USERNAME%`, `%USERPROFILE%`)
+- Windows 11 22H2+ only — absent on Windows 10 and earlier
+
+**PcaGeneralDb status codes:**
+
+| Code | Meaning |
+|---|---|
+| 0 | Install failure |
+| 1 | Driver/kernel block |
+| 2 | Abnormal exit |
+| 3 | PCA resolver invoked |
+| 4 | Unset |
+
+**Sample output:**
+```
+2025-04-18T14:32:07Z [M] PCASVC | Executed (GUI): C:\Users\user\Downloads\setup.exe
+2025-04-18T14:32:07Z [M] PCASVC | PCA: Status: Abnormal exit | Path: C:\Users\user\Downloads\setup.exe | By: Acme Corp | v2.1.0
+```
+
+**Performance:** Pure Python file read. Both files parsed in < 1 second.
+
+---
+
 ## 8. Output Formats
 
 ### 8.1 Parquet (default — recommended)
@@ -828,8 +875,9 @@ HDD sequential read speed (~150 MB/s) bottlenecks I/O-bound phases.
 | Registry | ✅ | ✅ |
 | SRUM | ✅ | ✅ |
 | Amcache | ✅ | ✅ |
+| PcaSvc (Win 11 22H2+) | ❌ | ✅ |
 | LNK / Jump Lists | ✅ | ✅ |
-| Browser history | ✅ | 🔜 v0.2 |
+| Browser history | ✅ | 🔜 v1.1 |
 | $LogFile | ✅ | ✅ |
 | macOS artifacts | ✅ | ❌ (Windows-focused) |
 | Linux artifacts | ✅ | ❌ (Windows-focused) |
@@ -842,8 +890,8 @@ HDD sequential read speed (~150 MB/s) bottlenecks I/O-bound phases.
 
 ---
 
-*supertimeline v0.1.0 — Built for forensic analysts who cannot afford to wait.*
+*supertimeline v1.0.0 — Built for forensic analysts who cannot afford to wait.*
 
 ---
 
-*Parsers: $MFT · $UsnJrnl · EVTx · Prefetch · LNK / Jump Lists · Registry · SRUM · Amcache · $LogFile*
+*Parsers: $MFT · $UsnJrnl · EVTx · Prefetch · LNK / Jump Lists · Registry · SRUM · Amcache · PcaSvc · $LogFile*

@@ -54,7 +54,7 @@ def _banner():
         combined_w = max(len(r) for r in rows)
 
         sub = "supertimeline".center(combined_w)
-        tag = "Forensic super-timeline generator  |  v0.1.0".center(combined_w)
+        tag = "Forensic super-timeline generator  |  v1.0.0".center(combined_w)
         sep = "-" * combined_w
 
         content = Group(
@@ -71,7 +71,7 @@ def _banner():
             f"[bold cyan]{'ChronosFracture'.center(W)}[/bold cyan]\n"
             f"[cyan]{'supertimeline'.center(W)}[/cyan]\n"
             f"[dim]{'-' * W}[/dim]\n"
-            f"[dim]{'Forensic super-timeline generator  |  v0.1.0'.center(W)}[/dim]"
+            f"[dim]{'Forensic super-timeline generator  |  v1.0.0'.center(W)}[/dim]"
         )
         console.print(Panel.fit(content, border_style="cyan", padding=(0, 2)))
     console.print()
