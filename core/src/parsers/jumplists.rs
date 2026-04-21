@@ -31,6 +31,16 @@ fn r_u64(d: &[u8], o: usize) -> u64 {
     if o + 8 > d.len() { return 0; }
     u64::from_le_bytes([d[o],d[o+1],d[o+2],d[o+3],d[o+4],d[o+5],d[o+6],d[o+7]])
 }
+fn r_utf16_counted(d: &[u8], off: usize, n: usize) -> String {
+    let end = (off + n * 2).min(d.len());
+    if off >= end { return String::new(); }
+    let pairs: Vec<u16> = d[off..end]
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    String::from_utf16_lossy(&pairs).to_string()
+}
 
 // ── CFB reader ────────────────────────────────────────────────────────────────
 
@@ -171,23 +181,20 @@ impl<'a> Cfb<'a> {
         raw[..sz].to_vec()
     }
 
-    /// Iterate all directory entries and return stream data for each stream
-    /// whose name is a hex number (the LNK streams in a Jump List).
-    pub fn lnk_streams(&self) -> Vec<(String, Vec<u8>)> {
+    /// Iterate all directory entries, returning (name, data) for every stream.
+    /// Callers filter by name: hex strings = LNK entries; "DestList" = metadata.
+    pub fn all_streams(&self) -> Vec<(String, Vec<u8>)> {
         let dir_data = Self::read_chain_static(
             self.data, r_u32(self.data, 0x30), self.sector_size, &self.fat
         );
-
         let mini_stream = self.mini_stream();
         let mut results = Vec::new();
         let entry_count = dir_data.len() / 128;
 
         for i in 0..entry_count {
             let e = &dir_data[i * 128..(i + 1) * 128];
-            let obj_type = e[0x42];
-            if obj_type != OBJ_STREAM { continue; }
+            if e[0x42] != OBJ_STREAM { continue; }
 
-            // Read entry name (UTF-16LE, length in bytes at 0x40)
             let name_len = r_u16(e, 0x40) as usize;
             if name_len < 2 { continue; }
             let name = String::from_utf16_lossy(
@@ -197,10 +204,6 @@ impl<'a> Cfb<'a> {
                     .take_while(|&c| c != 0)
                     .collect::<Vec<_>>()
             ).to_string();
-
-            // Only process streams whose name is a hex integer (the LNK entries)
-            // Skip "DestList", "Root Entry", etc.
-            if !name.chars().all(|c| c.is_ascii_hexdigit()) { continue; }
 
             let start = r_u32(e, 0x74);
             let size  = r_u64(e, 0x78);
@@ -222,20 +225,137 @@ impl<'a> Cfb<'a> {
 
 // ── Event extraction ──────────────────────────────────────────────────────────
 
+/// Parse the DestList stream from an automaticDestinations Jump List.
+///
+/// DestList contains per-entry last-access timestamps and target paths.
+/// Entry layout by version (empirically validated on Windows 10/11):
+///   v3 (Win7/8):  FILETIME at 0x20, path_len(u16) at 0x30, path at 0x32
+///   v4 (Win10+):  FILETIME at 0x64, path_len(u16) at 0x82, path at 0x84
+///
+/// Entry advancement: fixed_path_offset + 2 (path_len u16) + path_len * 2 + 2 (null)
+fn parse_destlist(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
+    if data.len() < 32 { return Vec::new(); }
+
+    let version     = r_u32(data, 0);
+    let num_entries = r_u32(data, 4) as usize;
+    if num_entries == 0 || num_entries > 5000 { return Vec::new(); }
+
+    // (filetime_off, path_len_off, path_off) relative to entry start
+    let layout = match version {
+        3 => (0x20usize, 0x30usize, 0x32usize),
+        4 => (0x64usize, 0x82usize, 0x84usize),
+        // Unknown version: scan for FILETIME in first 200 bytes then adjacent path
+        _ => {
+            return parse_destlist_scan(data, artifact_path, num_entries);
+        }
+    };
+    let (ft_off, pl_off, path_off) = layout;
+
+    let mut events = Vec::new();
+    let mut pos = 32usize; // skip DestList header
+
+    for _ in 0..num_entries {
+        if pos + path_off + 2 > data.len() { break; }
+
+        let ft       = r_u64(data, pos + ft_off);
+        let path_len = r_u16(data, pos + pl_off) as usize;
+
+        if path_len == 0 || path_len > 512 { break; }
+        if pos + path_off + path_len * 2 > data.len() { break; }
+
+        let target = r_utf16_counted(data, pos + path_off, path_len);
+        let ns     = crate::types::filetime_to_unix_ns(ft);
+
+        if ns > 0 && !target.is_empty() {
+            events.push(TimelineEvent {
+                timestamp_ns:    ns,
+                macb:            "A".to_string(),
+                source:          "JUMPLIST".to_string(),
+                artifact:        "JumpList".to_string(),
+                artifact_path:   artifact_path.to_string(),
+                message:         format!("JumpList accessed: {}", target),
+                hostname:        None,
+                tz_offset_secs:  0,
+                is_fn_timestamp: false,
+                source_hash:     None,
+                extra:           Some(serde_json::json!({
+                    "target_path":       &target,
+                    "destlist_version":  version,
+                })),
+            });
+        }
+
+        // Advance: path_off includes the path_len uint16, then path_len chars + null
+        pos += path_off + 2 + path_len * 2;
+    }
+    events
+}
+
+/// Fallback DestList parser for unknown versions: scan for valid FILETIME values
+/// followed by a uint16 length-prefixed UTF-16LE string.
+fn parse_destlist_scan(data: &[u8], artifact_path: &str, max_entries: usize) -> Vec<TimelineEvent> {
+    // Valid FILETIME range: year 2000 to 2040
+    const MIN_FT: u64 = 125_911_584_000_000_000;
+    const MAX_FT: u64 = 137_919_648_000_000_000;
+
+    let mut events = Vec::new();
+    let mut i = 32usize; // skip header
+
+    while i + 8 < data.len() && events.len() < max_entries {
+        let val = r_u64(data, i);
+        if val >= MIN_FT && val <= MAX_FT {
+            let ns = crate::types::filetime_to_unix_ns(val);
+            // Scan up to 64 bytes after the FILETIME for a counted UTF-16LE string
+            let scan_end = (i + 8 + 64).min(data.len().saturating_sub(2));
+            for k in (i + 8..scan_end).step_by(2) {
+                let len = r_u16(data, k) as usize;
+                if len > 0 && len < 256 && k + 2 + len * 2 <= data.len() {
+                    let s = r_utf16_counted(data, k + 2, len);
+                    if s.len() >= 3 && s.contains('\\') {
+                        events.push(TimelineEvent {
+                            timestamp_ns:    ns,
+                            macb:            "A".to_string(),
+                            source:          "JUMPLIST".to_string(),
+                            artifact:        "JumpList".to_string(),
+                            artifact_path:   artifact_path.to_string(),
+                            message:         format!("JumpList accessed: {}", s),
+                            hostname:        None,
+                            tz_offset_secs:  0,
+                            is_fn_timestamp: false,
+                            source_hash:     None,
+                            extra:           Some(serde_json::json!({"target_path": &s})),
+                        });
+                        i = k + 2 + len * 2;
+                        break;
+                    }
+                }
+            }
+        }
+        i += 4;
+    }
+    events
+}
+
 fn parse_auto_destinations(data: &[u8], file_path: &str) -> Vec<TimelineEvent> {
     let cfb = match Cfb::new(data) {
         Some(c) => c,
         None    => return Vec::new(),
     };
 
-    cfb.lnk_streams()
-        .into_iter()
-        .flat_map(|(_name, stream)| {
-            parse_lnk_bytes_inner(&stream)
-                .map(|p| events_from_lnk(p, file_path))
-                .unwrap_or_default()
-        })
-        .collect()
+    let mut events = Vec::new();
+
+    for (name, stream) in cfb.all_streams() {
+        if name.eq_ignore_ascii_case("DestList") {
+            // Primary source: access timestamps + target paths
+            events.extend(parse_destlist(&stream, file_path));
+        } else if name.chars().all(|c| c.is_ascii_hexdigit()) {
+            // LNK stream: use embedded timestamps only if non-zero
+            if let Some(parsed) = parse_lnk_bytes_inner(&stream) {
+                events.extend(events_from_lnk(parsed, file_path));
+            }
+        }
+    }
+    events
 }
 
 /// Parse a .customDestinations-ms file.

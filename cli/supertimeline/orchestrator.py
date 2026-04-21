@@ -49,6 +49,9 @@ ARTIFACT_PATTERNS: List[tuple[str, str, bool]] = [
     ("SRUM",      "Windows/System32/sru/SRUDB.dat",                        False),
     ("AMCACHE",   "Windows/AppCompat/Programs/Amcache.hve",                 False),
 
+    # User activity artifacts (per-user, wildcard paths)
+    ("LNK",       "Users/*/AppData/Roaming/Microsoft/Windows/Recent/",     True),
+
     # Registry hives
     ("REGISTRY",  "Windows/System32/config/SYSTEM",                        False),
     ("REGISTRY",  "Windows/System32/config/SOFTWARE",                      False),
@@ -234,6 +237,10 @@ def _dispatch_rust(job: ArtifactJob) -> List[Dict[str, Any]]:
         from supertimeline.parsers.prefetch import parse_dir
         return parse_dir(job.path)
 
+    if job.artifact_type == "LNK":
+        from supertimeline.parsers.lnk import parse_dir as parse_lnk_dir
+        return parse_lnk_dir(job.path)
+
     # Fall through to Python parsers for remaining types
     return _dispatch_python(job)
 
@@ -275,6 +282,7 @@ _LOGICAL_PATH_MAP: Dict[str, str] = {
     "SECURITY":    "Windows\\System32\\config\\SECURITY",
     "SRUDB.dat":   "Windows\\System32\\sru\\SRUDB.dat",
     "Amcache.hve": "Windows\\AppCompat\\Programs\\Amcache.hve",
+    "Recent":      "Users\\*\\AppData\\Roaming\\Microsoft\\Windows\\Recent",
 }
 
 
@@ -323,7 +331,11 @@ def _discover_from_extracted(root: str) -> List[ArtifactJob]:
                     path=str(candidate),
                     size_bytes=size,
                     is_directory=True,
-                    logical_path=f"Windows\\Prefetch" if artifact_type == "PREFETCH" else flat_name,
+                    logical_path=(
+                        "Windows\\Prefetch" if artifact_type == "PREFETCH"
+                        else "Users\\*\\AppData\\Roaming\\Microsoft\\Windows\\Recent" if artifact_type == "LNK"
+                        else flat_name
+                    ),
                 ))
         elif not is_directory and candidate.is_file():
             try:

@@ -138,6 +138,8 @@ _EXTRACT_TARGETS: Dict[str, str] = {
     "Windows/System32/config/SECURITY": "SECURITY",
     "Windows/System32/sru/SRUDB.dat":   "SRUDB.dat",
     "Windows/AppCompat/Programs/Amcache.hve": "Amcache.hve",
+    # Per-user Recent dirs are extracted dynamically by _tsk_extract_user_recent()
+    # into Recent/<username>/ and registered here as a single directory target.
 }
 
 # Maps extracted flat name → (artifact_type, is_directory)
@@ -155,6 +157,7 @@ EXTRACTED_ARTIFACT_MAP: Dict[str, Tuple[str, bool]] = {
     "SECURITY":     ("REGISTRY",  False),
     "SRUDB.dat":    ("SRUM",      False),
     "Amcache.hve":  ("AMCACHE",   False),
+    "Recent":       ("LNK",       True),    # per-user Recent dirs, extracted dynamically
 }
 
 
@@ -228,6 +231,44 @@ def _tsk_extract_dir(fs_obj, inode_path: str, dest_dir: str) -> int:
                 continue
     except Exception:
         pass
+    return count
+
+
+def _tsk_extract_user_recent(fs_obj, tmp_dir: str) -> int:
+    """
+    Enumerate Users/ on the filesystem and extract each user's Recent/ directory.
+
+    Output structure:
+        <tmp_dir>/Recent/<username>/
+            *.lnk
+            AutomaticDestinations/*.automaticDestinations-ms
+            CustomDestinations/*.customDestinations-ms
+    """
+    count = 0
+    dest_root = os.path.join(tmp_dir, "Recent")
+    try:
+        users_dir = fs_obj.open_dir("Users")
+    except Exception:
+        return 0
+
+    for entry in users_dir:
+        name = entry.info.name.name
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", errors="replace")
+        if name in (".", "..", "All Users", "Default", "Default User", "Public"):
+            continue
+        if not (entry.info.meta and entry.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR):
+            continue
+
+        recent_src = f"Users/{name}/AppData/Roaming/Microsoft/Windows/Recent"
+        recent_dst = os.path.join(dest_root, name)
+        try:
+            n = _tsk_extract_dir(fs_obj, recent_src, recent_dst)
+            if n > 0:
+                count += n
+        except Exception:
+            continue
+
     return count
 
 
@@ -341,6 +382,11 @@ def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
             else:
                 sparse = src_path in _SPARSE_TARGETS
                 _tsk_extract_file(fs, src_path, dest, sparse_aware=sparse)
+
+        # Per-user Recent directories (LNK files + Jump Lists)
+        if progress_cb:
+            progress_cb("Users/*/AppData/Roaming/Microsoft/Windows/Recent")
+        _tsk_extract_user_recent(fs, tmp_dir)
 
         return tmp_dir
 
