@@ -48,6 +48,9 @@ ARTIFACT_PATTERNS: List[tuple[str, str, bool]] = [
     ("PREFETCH",  "Windows/Prefetch/",                                      True),
     ("SRUM",      "Windows/System32/sru/SRUDB.dat",                        False),
     ("AMCACHE",   "Windows/AppCompat/Programs/Amcache.hve",                 False),
+    ("PCASVC",    "Windows/appcompat/pca/PcaAppLaunchDic.txt",              False),
+    ("PCASVC",    "Windows/appcompat/pca/PcaGeneralDb0.txt",                False),
+    ("PCASVC",    "Windows/appcompat/pca/PcaGeneralDb1.txt",                False),
 
     # User activity artifacts (per-user, wildcard paths)
     ("LNK",       "Users/*/AppData/Roaming/Microsoft/Windows/Recent/",     True),
@@ -265,6 +268,10 @@ def _dispatch_python(job: ArtifactJob) -> List[Dict[str, Any]]:
     if job.artifact_type == "AMCACHE":
         from supertimeline.parsers.amcache import parse_amcache
         return parse_amcache(job.path)
+
+    if job.artifact_type == "PCASVC":
+        from supertimeline.parsers.pcasvc import parse
+        return parse(job.path)
 
     log.debug("No parser for artifact type %s — skipping", job.artifact_type)
     return []

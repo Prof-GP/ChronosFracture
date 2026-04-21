@@ -111,6 +111,7 @@ When `$UsnJrnl:$J` has been wiped, use `--recover-usnjrnl` to carve remnant USN 
 | Registry hives | Python | 1 per key (last-written time) |
 | SRUM (`SRUDB.dat`) | Python | 1 per record |
 | Amcache (`Amcache.hve`) | Python | 1 per entry |
+| PcaSvc (`PcaAppLaunchDic.txt`, `PcaGeneralDb*.txt`) | Python | 1 per execution record (Windows 11 22H2+) |
 
 ---
 

@@ -138,6 +138,9 @@ _EXTRACT_TARGETS: Dict[str, str] = {
     "Windows/System32/config/SECURITY": "SECURITY",
     "Windows/System32/sru/SRUDB.dat":   "SRUDB.dat",
     "Windows/AppCompat/Programs/Amcache.hve": "Amcache.hve",
+    "Windows/appcompat/pca/PcaAppLaunchDic.txt": "PcaAppLaunchDic.txt",
+    "Windows/appcompat/pca/PcaGeneralDb0.txt":   "PcaGeneralDb0.txt",
+    "Windows/appcompat/pca/PcaGeneralDb1.txt":   "PcaGeneralDb1.txt",
     # Per-user Recent dirs are extracted dynamically by _tsk_extract_user_recent()
     # into Recent/<username>/ and registered here as a single directory target.
 }
@@ -156,7 +159,10 @@ EXTRACTED_ARTIFACT_MAP: Dict[str, Tuple[str, bool]] = {
     "SAM":          ("REGISTRY",  False),
     "SECURITY":     ("REGISTRY",  False),
     "SRUDB.dat":    ("SRUM",      False),
-    "Amcache.hve":  ("AMCACHE",   False),
+    "Amcache.hve":           ("AMCACHE",  False),
+    "PcaAppLaunchDic.txt":   ("PCASVC",   False),
+    "PcaGeneralDb0.txt":     ("PCASVC",   False),
+    "PcaGeneralDb1.txt":     ("PCASVC",   False),
     "Recent":       ("LNK",       True),    # per-user Recent dirs, extracted dynamically
 }
 
