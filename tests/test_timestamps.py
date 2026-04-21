@@ -42,13 +42,15 @@ class TestFiletimeToUnixNs:
 class TestUnixNsToIso:
 
     def test_unix_epoch_format(self):
+        # Zero sub-second component → no fractional part
         iso = unix_ns_to_iso(0)
-        assert iso == "1970-01-01T00:00:00.000000000Z"
+        assert iso == "1970-01-01T00:00:00Z"
 
     def test_known_date(self):
         ns = 1_577_836_800 * 1_000_000_000
         iso = unix_ns_to_iso(ns)
-        assert iso.startswith("2020-01-01T00:00:00")
+        # Whole-second value — no fractional component
+        assert iso == "2020-01-01T00:00:00Z"
 
     def test_nanosecond_fraction(self):
         # 1 nanosecond past epoch

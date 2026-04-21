@@ -12,6 +12,8 @@ def unix_ns_to_iso(ns: int) -> str:
     try:
         dt = datetime.fromtimestamp(secs, tz=timezone.utc)
         frac = ns % 1_000_000_000
-        return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{frac:09d}Z"
+        if frac == 0:
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return dt.strftime("%Y-%m-%dT%H:%M:%S") + "." + f"{frac:09d}".rstrip("0") + "Z"
     except (OSError, OverflowError, ValueError):
-        return "1601-01-01T00:00:00.000000000Z"
+        return "1601-01-01T00:00:00Z"

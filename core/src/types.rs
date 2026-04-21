@@ -31,13 +31,7 @@ pub struct TimelineEvent {
 
 impl TimelineEvent {
     pub fn timestamp_iso(&self) -> String {
-        use chrono::{Utc, TimeZone};
-        let secs = self.timestamp_ns / 1_000_000_000;
-        let nanos = (self.timestamp_ns % 1_000_000_000) as u32;
-        match Utc.timestamp_opt(secs, nanos) {
-            chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string(),
-            _ => "1601-01-01T00:00:00.000000000Z".to_string(),
-        }
+        crate::utils::timestamps::ns_to_iso(self.timestamp_ns)
     }
 }
 
