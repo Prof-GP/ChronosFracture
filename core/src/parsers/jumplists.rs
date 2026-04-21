@@ -1,0 +1,310 @@
+/// Jump List parser — handles both formats:
+///   .automaticDestinations-ms  — OLE/CFB compound document; each numbered stream is an LNK
+///   .customDestinations-ms     — flat concatenation of LNK records
+use pyo3::prelude::*;
+use pyo3::types::{PyList, PyDict};
+
+use crate::types::TimelineEvent;
+use super::lnk::{parse_lnk_bytes_inner, events_from_lnk};
+
+// ── CFB (OLE Compound File Binary) constants ──────────────────────────────────
+
+const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+const ENDOFCHAIN: u32 = 0xFFFFFFFE;
+const FREESECT:   u32 = 0xFFFFFFFF;
+const FATSECT:    u32 = 0xFFFFFFFD;
+const DIFSECT:    u32 = 0xFFFFFFFC;
+
+// Directory entry object types
+const OBJ_STREAM:  u8 = 2;
+
+fn r_u16(d: &[u8], o: usize) -> u16 {
+    if o + 2 > d.len() { return 0; }
+    u16::from_le_bytes([d[o], d[o+1]])
+}
+fn r_u32(d: &[u8], o: usize) -> u32 {
+    if o + 4 > d.len() { return 0; }
+    u32::from_le_bytes([d[o], d[o+1], d[o+2], d[o+3]])
+}
+fn r_u64(d: &[u8], o: usize) -> u64 {
+    if o + 8 > d.len() { return 0; }
+    u64::from_le_bytes([d[o],d[o+1],d[o+2],d[o+3],d[o+4],d[o+5],d[o+6],d[o+7]])
+}
+
+// ── CFB reader ────────────────────────────────────────────────────────────────
+
+struct Cfb<'a> {
+    data:             &'a [u8],
+    sector_size:      usize,
+    mini_sector_size: usize,
+    mini_cutoff:      u32,
+    fat:              Vec<u32>,
+    mini_fat:         Vec<u32>,
+    /// Root entry's start sector and stream size (the mini-stream host)
+    root_start:       u32,
+    root_size:        u64,
+}
+
+impl<'a> Cfb<'a> {
+    fn new(data: &'a [u8]) -> Option<Self> {
+        if data.len() < 512 { return None; }
+        if data[0..8] != CFB_MAGIC { return None; }
+
+        // MS-CFB header layout:
+        //   0x18 MinorVersion, 0x1A MajorVersion, 0x1C ByteOrder (0xFFFE)
+        //   0x1E SectorSizePower (9 => 512B, 12 => 4096B)
+        //   0x20 MiniSectorSizePower (6 => 64B)
+        let sector_size_shift      = r_u16(data, 0x1E) as u32;
+        let mini_sector_size_shift = r_u16(data, 0x20) as u32;
+        let sector_size            = 1usize << sector_size_shift.min(16);
+        let mini_sector_size       = 1usize << mini_sector_size_shift.min(12);
+
+        let num_fat_sectors        = r_u32(data, 0x2C);
+        let first_dir_sector       = r_u32(data, 0x30);
+        let mini_cutoff            = r_u32(data, 0x38); // typically 0x1000 = 4096
+        let first_mini_fat_sector  = r_u32(data, 0x3C);
+        let num_mini_fat_sectors   = r_u32(data, 0x40);
+        let first_difat_sector     = r_u32(data, 0x44);
+
+        // Collect FAT sector numbers from the header DIFAT array (109 entries at 0x4C)
+        let mut fat_sectors: Vec<u32> = Vec::new();
+        for i in 0..109usize {
+            let s = r_u32(data, 0x4C + i * 4);
+            if s >= DIFSECT { break; }
+            fat_sectors.push(s);
+        }
+
+        // Follow DIFAT chain if needed
+        let mut difat = first_difat_sector;
+        while difat < DIFSECT {
+            let off = Self::sector_off_static(difat, sector_size);
+            if off + sector_size > data.len() { break; }
+            let entries = (sector_size - 4) / 4;
+            for i in 0..entries {
+                let s = r_u32(data, off + i * 4);
+                if s >= DIFSECT { break; }
+                fat_sectors.push(s);
+            }
+            difat = r_u32(data, off + sector_size - 4);
+        }
+
+        // Build FAT
+        let mut fat: Vec<u32> = Vec::with_capacity(num_fat_sectors as usize * (sector_size / 4));
+        for &s in &fat_sectors {
+            let off = Self::sector_off_static(s, sector_size);
+            if off + sector_size > data.len() { break; }
+            for i in 0..(sector_size / 4) {
+                fat.push(r_u32(data, off + i * 4));
+            }
+        }
+
+        // Build mini FAT
+        let mut mini_fat: Vec<u32> = Vec::with_capacity(num_mini_fat_sectors as usize * (sector_size / 4));
+        let mut ms = first_mini_fat_sector;
+        while ms < ENDOFCHAIN {
+            let off = Self::sector_off_static(ms, sector_size);
+            if off + sector_size > data.len() { break; }
+            for i in 0..(sector_size / 4) {
+                mini_fat.push(r_u32(data, off + i * 4));
+            }
+            ms = fat.get(ms as usize).copied().unwrap_or(ENDOFCHAIN);
+        }
+
+        // Read root directory entry to get mini-stream start + size
+        let dir_data = Self::read_chain_static(data, first_dir_sector, sector_size, &fat);
+        if dir_data.len() < 128 { return None; }
+        let root_start = r_u32(&dir_data, 0x74);
+        let root_size  = r_u64(&dir_data, 0x78);
+
+        Some(Cfb {
+            data, sector_size, mini_sector_size, mini_cutoff,
+            fat, mini_fat, root_start, root_size,
+        })
+    }
+
+    fn sector_off_static(sector: u32, sector_size: usize) -> usize {
+        512 + sector as usize * sector_size
+    }
+
+    fn sector_off(&self, sector: u32) -> usize {
+        Self::sector_off_static(sector, self.sector_size)
+    }
+
+    fn read_chain_static(data: &[u8], start: u32, sector_size: usize, fat: &[u32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cur = start;
+        let mut guard = 0usize;
+        while cur < ENDOFCHAIN && guard < 65536 {
+            let off = Self::sector_off_static(cur, sector_size);
+            if off + sector_size > data.len() { break; }
+            out.extend_from_slice(&data[off..off + sector_size]);
+            cur = fat.get(cur as usize).copied().unwrap_or(ENDOFCHAIN);
+            guard += 1;
+        }
+        out
+    }
+
+    fn read_chain(&self, start: u32) -> Vec<u8> {
+        Self::read_chain_static(self.data, start, self.sector_size, &self.fat)
+    }
+
+    fn read_mini_chain(&self, start: u32, size: u64, mini_stream: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cur = start;
+        let mut guard = 0usize;
+        while cur < ENDOFCHAIN && guard < 65536 {
+            let off = cur as usize * self.mini_sector_size;
+            if off + self.mini_sector_size > mini_stream.len() { break; }
+            out.extend_from_slice(&mini_stream[off..off + self.mini_sector_size]);
+            cur = self.mini_fat.get(cur as usize).copied().unwrap_or(ENDOFCHAIN);
+            guard += 1;
+        }
+        out.truncate(size as usize);
+        out
+    }
+
+    /// Return the mini-stream data (the root entry's stream).
+    fn mini_stream(&self) -> Vec<u8> {
+        let raw = self.read_chain(self.root_start);
+        let sz = self.root_size.min(raw.len() as u64) as usize;
+        raw[..sz].to_vec()
+    }
+
+    /// Iterate all directory entries and return stream data for each stream
+    /// whose name is a hex number (the LNK streams in a Jump List).
+    pub fn lnk_streams(&self) -> Vec<(String, Vec<u8>)> {
+        let dir_data = Self::read_chain_static(
+            self.data, r_u32(self.data, 0x30), self.sector_size, &self.fat
+        );
+
+        let mini_stream = self.mini_stream();
+        let mut results = Vec::new();
+        let entry_count = dir_data.len() / 128;
+
+        for i in 0..entry_count {
+            let e = &dir_data[i * 128..(i + 1) * 128];
+            let obj_type = e[0x42];
+            if obj_type != OBJ_STREAM { continue; }
+
+            // Read entry name (UTF-16LE, length in bytes at 0x40)
+            let name_len = r_u16(e, 0x40) as usize;
+            if name_len < 2 { continue; }
+            let name = String::from_utf16_lossy(
+                &e[0..name_len.min(64)]
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .take_while(|&c| c != 0)
+                    .collect::<Vec<_>>()
+            ).to_string();
+
+            // Only process streams whose name is a hex integer (the LNK entries)
+            // Skip "DestList", "Root Entry", etc.
+            if !name.chars().all(|c| c.is_ascii_hexdigit()) { continue; }
+
+            let start = r_u32(e, 0x74);
+            let size  = r_u64(e, 0x78);
+            if start >= ENDOFCHAIN || size == 0 { continue; }
+
+            let stream_data = if size < self.mini_cutoff as u64 {
+                self.read_mini_chain(start, size, &mini_stream)
+            } else {
+                let mut d = self.read_chain(start);
+                d.truncate(size as usize);
+                d
+            };
+
+            results.push((name, stream_data));
+        }
+        results
+    }
+}
+
+// ── Event extraction ──────────────────────────────────────────────────────────
+
+fn parse_auto_destinations(data: &[u8], file_path: &str) -> Vec<TimelineEvent> {
+    let cfb = match Cfb::new(data) {
+        Some(c) => c,
+        None    => return Vec::new(),
+    };
+
+    cfb.lnk_streams()
+        .into_iter()
+        .flat_map(|(_name, stream)| {
+            parse_lnk_bytes_inner(&stream)
+                .map(|p| events_from_lnk(p, file_path))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Parse a .customDestinations-ms file.
+/// Format: concatenated LNK records (each starts with 4C 00 00 00).
+/// Scan for LNK headers rather than rely on a fixed framing structure.
+fn parse_custom_destinations(data: &[u8], file_path: &str) -> Vec<TimelineEvent> {
+    let mut events = Vec::new();
+    let mut i = 0usize;
+
+    while i + 4 < data.len() {
+        // LNK header starts with HeaderSize = 0x0000004C
+        if data[i..i+4] == [0x4C, 0x00, 0x00, 0x00] {
+            let slice = &data[i..];
+            if let Some(parsed) = parse_lnk_bytes_inner(slice) {
+                events.extend(events_from_lnk(parsed, file_path));
+                // Advance past this LNK (minimum 76 bytes + at least one section)
+                i += 76;
+                continue;
+            }
+        }
+        i += 4;
+    }
+    events
+}
+
+/// Parse Jump List bytes, auto-detecting format (CFB or custom destinations).
+pub fn parse_jumplist_bytes_inner(data: &[u8], file_path: &str) -> Vec<TimelineEvent> {
+    if data.len() < 8 { return Vec::new(); }
+
+    if data[0..8] == CFB_MAGIC {
+        parse_auto_destinations(data, file_path)
+    } else {
+        parse_custom_destinations(data, file_path)
+    }
+}
+
+// ── Python interface ──────────────────────────────────────────────────────────
+
+fn event_to_dict<'py>(py: Python<'py>, ev: &TimelineEvent) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("timestamp_ns",    ev.timestamp_ns)?;
+    d.set_item("timestamp_iso",   ev.timestamp_iso())?;
+    d.set_item("macb",            &ev.macb)?;
+    d.set_item("source",          &ev.source)?;
+    d.set_item("artifact",        &ev.artifact)?;
+    d.set_item("artifact_path",   &ev.artifact_path)?;
+    d.set_item("message",         &ev.message)?;
+    d.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
+    d.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
+    if let Some(x) = &ev.extra {
+        d.set_item("target_path",  x["target_path"].as_str().unwrap_or(""))?;
+        d.set_item("drive_type",   x["drive_type"].as_u64().unwrap_or(0))?;
+        d.set_item("drive_serial", x["drive_serial"].as_str().unwrap_or(""))?;
+        d.set_item("volume_label", x["volume_label"].as_str().unwrap_or(""))?;
+    }
+    Ok(d)
+}
+
+/// Parse a Jump List file (.automaticDestinations-ms or .customDestinations-ms) from bytes.
+#[pyfunction]
+pub fn parse_jumplist_bytes(
+    py: Python<'_>,
+    data: &[u8],
+    file_path: &str,
+) -> PyResult<Py<PyList>> {
+    let events = parse_jumplist_bytes_inner(data, file_path);
+    let list = PyList::empty_bound(py);
+    for ev in &events {
+        list.append(event_to_dict(py, ev)?)?;
+    }
+    Ok(list.into())
+}
