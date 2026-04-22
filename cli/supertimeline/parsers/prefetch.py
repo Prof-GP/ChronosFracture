@@ -52,9 +52,13 @@ def parse_dir(prefetch_dir: str) -> List[Dict[str, Any]]:
 def _parse_one(pf_path: Path) -> List[Dict[str, Any]]:
     # pyscca handles MAM decompression + parsing natively (Linux primary)
     if _PYSCCA:
-        return _parse_via_pyscca(pf_path)
+        result = _parse_via_pyscca(pf_path)
+        if result:
+            return result
+        # pyscca returned nothing (e.g. old libscca can't handle this MAM variant)
+        # fall through to the Rust native decompressor below
 
-    # Windows: decompress via windowsprefetch/ntdll then parse with Rust
+    # Decompress MAM if needed (Rust native first, then platform-specific fallbacks)
     raw = pf_path.read_bytes()
     if is_mam_compressed(raw):
         data = _decompress_mam_file(pf_path, raw)
@@ -73,12 +77,22 @@ def _parse_one(pf_path: Path) -> List[Dict[str, Any]]:
 def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
     """Parse using libscca — handles MAM decompression natively."""
     import datetime
+    import os
 
     scca = pyscca.file()
     try:
-        scca.open(str(pf_path))
+        # Suppress libscca's C-level error output — it writes directly to stderr
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_stderr = os.dup(2)
+        os.dup2(devnull, 2)
+        try:
+            scca.open(str(pf_path))
+        finally:
+            os.dup2(old_stderr, 2)
+            os.close(old_stderr)
+            os.close(devnull)
     except Exception as exc:
-        log.warning("pyscca cannot open %s: %s", pf_path.name, exc)
+        log.debug("pyscca cannot open %s: %s", pf_path.name, exc)
         return []
 
     try:
@@ -117,6 +131,14 @@ def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
 
 
 def _decompress_mam_file(pf_path: Path, raw: bytes) -> bytes:
+    # Cross-platform: Rust native LZXPRESS Huffman decompressor (no OS deps).
+    # Tried first on all platforms; falls through to platform-specific paths on failure.
+    if _RUST:
+        try:
+            return bytes(_core.decompress_mam_py(raw))
+        except Exception as exc:
+            log.debug("Rust MAM decompression failed for %s: %s", pf_path.name, exc)
+
     # Windows: windowsprefetch uses ntdll
     try:
         from windowsprefetch.utils import DecompressWin10
