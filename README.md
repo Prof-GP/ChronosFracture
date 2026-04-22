@@ -53,18 +53,33 @@ pip install .
 supertimeline --help
 ```
 
-### Optional extras
+### Optional extras — disk image support
 
-**Windows** — disk image mounting support:
+By default, supertimeline works with **mounted volumes** (`E:\`, `/mnt/img`) and **extracted artifact directories**. To parse raw/E01/VMDK/VHD images directly, install the platform extra.
+
+**Windows:**
 ```bash
-pip install -r requirements-windows.txt
+pip install ".[windows]"
 ```
+Installs `pytsk3` (The Sleuth Kit) and `windowsprefetch` (MAM-compressed prefetch decompression).
 
-**Linux / WSL** — system packages + disk image support:
+> **Tip:** For E01 images on Windows, [Arsenal Image Mounter](https://arsenalrecon.com/products/arsenal-image-mounter) is often simpler — mount the image as a drive letter and point supertimeline at it without needing pytsk3.
+
+**Linux / WSL:**
 ```bash
+# System packages
 sudo apt-get install -y build-essential python3-dev ewf-tools ntfs-3g
-pip install -r requirements-linux.txt
+
+# Python extras (pytsk3)
+pip install ".[linux]"
+
+# pyscca (libscca) — prefetch parsing + MAM decompression (not on PyPI)
+sudo apt-get install -y python3-libscca
+cp /usr/lib/python3/dist-packages/pyscca*.so \
+   $(python -c "import site; print(site.getsitepackages()[0])")
 ```
+
+See [`requirements-linux.txt`](cli/requirements-linux.txt) for E01 mount commands and WSL-specific notes.
 
 ---
 

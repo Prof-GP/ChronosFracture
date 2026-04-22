@@ -1,13 +1,13 @@
-# Windows — optional extras not in pyproject.toml
-# Install after: pip install .
-# Then: pip install -r requirements-windows.txt
-
-pyarrow>=17.0.0
-click>=8.0.0
-rich>=13.0.0
-python-registry>=1.3.1
-pytsk3>=20230101
-windowsprefetch>=4.0.3
-
-# pyewf is not on PyPI — install from libyal builds or use Arsenal Image Mounter
-# for E01 support on Windows, pyewf may not be required if pytsk3 handles it directly
+# Windows optional extras — disk image support
+#
+# Use pip extras (preferred):
+#   pip install ".[windows]"
+#
+# This installs:
+#   pytsk3           — raw / E01 / VMDK / VHD image parsing (The Sleuth Kit)
+#   windowsprefetch  — MAM decompression for Windows 10/11 prefetch files
+#
+# For E01 images, Arsenal Image Mounter is often simpler than pytsk3:
+#   https://arsenalrecon.com/products/arsenal-image-mounter
+#   Mount the image as a drive letter, then:
+#   supertimeline run E:\ -o out.parquet

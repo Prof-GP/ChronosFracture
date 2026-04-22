@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "supertimeline"
-version = "0.1.0"
+version = "1.0.0"
 description = "High-performance forensic super-timeline generator"
 requires-python = ">=3.10"
 dependencies = [

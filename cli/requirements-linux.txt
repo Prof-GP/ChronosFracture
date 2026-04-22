@@ -1,27 +1,23 @@
-# Linux / WSL — optional extras not in pyproject.toml
+# Linux / WSL optional extras — disk image support
 #
-# System packages (Ubuntu/Debian):
+# Step 1 — system packages:
 #   sudo apt-get install -y build-essential python3-dev ewf-tools ntfs-3g
 #
-# Install after: pip install .
-# Then: pip install -r requirements-linux.txt
+# Step 2 — Python extras (pytsk3):
+#   pip install ".[linux]"
 #
-# E01 mounting (WSL):
-#   sudo ewfmount image.E01 /mnt/ewf_mount
-#   sudo mount -t ntfs-3g -o ro,loop,offset=<partition_offset> /mnt/ewf_mount/ewf1 /mnt/img_mount
-#   supertimeline run /mnt/img_mount --output out.parquet
-#
-# MAM-compressed prefetch files (.pf) require Windows Python accessible via WSL interop.
-# Ensure Windows Python has windowsprefetch installed:
-#   (from Windows) pip install windowsprefetch
-
-pyarrow>=17.0.0
-click>=8.0.0
-rich>=13.0.0
-python-registry>=1.3.1
-pytsk3>=20230101
-
-# pyscca (libscca) — prefetch parsing + MAM decompression on Linux
-# Not on PyPI — install via apt then copy .so into venv:
+# Step 3 — pyscca (libscca) — prefetch parsing + MAM decompression
+#   Not on PyPI; install via apt then copy the .so into your venv:
 #   sudo apt-get install -y python3-libscca
-#   cp /usr/lib/python3/dist-packages/pyscca*.so <venv>/lib/python3.x/site-packages/
+#   cp /usr/lib/python3/dist-packages/pyscca*.so \
+#      $(python -c "import site; print(site.getsitepackages()[0])")
+#
+# Step 4 — mounting an E01 image under WSL:
+#   sudo ewfmount image.E01 /mnt/ewf_mount
+#   sudo mount -t ntfs-3g -o ro,loop,offset=<partition_offset> \
+#              /mnt/ewf_mount/ewf1 /mnt/img_mount
+#   supertimeline run /mnt/img_mount -o out.parquet
+#
+# MAM-compressed prefetch files (.pf) also require Windows Python accessible
+# via WSL interop with windowsprefetch installed on the Windows side:
+#   (from Windows PowerShell) pip install windowsprefetch

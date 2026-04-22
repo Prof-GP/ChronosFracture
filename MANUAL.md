@@ -175,6 +175,33 @@ pip invokes the Rust build automatically — no separate maturin step needed.
 supertimeline --help
 ```
 
+### Step 5 — Optional extras (disk image support)
+
+By default, supertimeline works with **mounted volumes** and **extracted artifact directories**. To parse raw/E01/VMDK/VHD images directly, install the platform extra.
+
+**Windows** — installs `pytsk3` + `windowsprefetch`:
+```bash
+pip install ".[windows]"
+```
+
+> For E01 images, [Arsenal Image Mounter](https://arsenalrecon.com/products/arsenal-image-mounter) is often simpler — mount as a drive letter and skip pytsk3 entirely.
+
+**Linux / WSL** — installs `pytsk3` + system packages:
+```bash
+# System packages
+sudo apt-get install -y build-essential python3-dev ewf-tools ntfs-3g
+
+# Python extras
+pip install ".[linux]"
+
+# pyscca (libscca) — prefetch parsing + MAM decompression (not on PyPI)
+sudo apt-get install -y python3-libscca
+cp /usr/lib/python3/dist-packages/pyscca*.so \
+   $(python -c "import site; print(site.getsitepackages()[0])")
+```
+
+See [`requirements-linux.txt`](../cli/requirements-linux.txt) for E01 mount commands under WSL.
+
 ---
 
 ## 4. Quick Start
