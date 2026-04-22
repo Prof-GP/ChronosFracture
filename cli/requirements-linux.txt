@@ -3,16 +3,22 @@
 # Step 1 — system packages:
 #   sudo apt-get install -y build-essential python3-dev ewf-tools ntfs-3g
 #
-# Step 2 — Python extras (pytsk3):
-#   pip install ".[linux]"
+# Step 2 — Python extras (pytsk3).
+#   Install pytsk3 BEFORE running pip install . to avoid a Rust rebuild conflict:
+#   pip install pytsk3
+#   pip install .
 #
-# Step 3 — pyscca (libscca) — prefetch parsing + MAM decompression
-#   Not on PyPI; install via apt then copy the .so into your venv:
+# Step 3 — pyewf (E01 / EWF image support) — not on PyPI:
+#   sudo apt-get install -y python3-libewf
+#   cp /usr/lib/python3/dist-packages/pyewf*.so \
+#      $(python -c "import site; print(site.getsitepackages()[0])")
+#
+# Step 4 — pyscca (libscca) — prefetch parsing + MAM decompression — not on PyPI:
 #   sudo apt-get install -y python3-libscca
 #   cp /usr/lib/python3/dist-packages/pyscca*.so \
 #      $(python -c "import site; print(site.getsitepackages()[0])")
 #
-# Step 4 — mounting an E01 image under WSL:
+# Step 5 — mounting an E01 image under WSL:
 #   sudo ewfmount image.E01 /mnt/ewf_mount
 #   sudo mount -t ntfs-3g -o ro,loop,offset=<partition_offset> \
 #              /mnt/ewf_mount/ewf1 /mnt/img_mount
@@ -21,3 +27,8 @@
 # MAM-compressed prefetch files (.pf) also require Windows Python accessible
 # via WSL interop with windowsprefetch installed on the Windows side:
 #   (from Windows PowerShell) pip install windowsprefetch
+#
+# NOTE: pip install ".[linux]" will attempt to rebuild the supertimeline wheel
+# using whatever Rust is available at that moment, which may differ from the
+# pinned version in rust-toolchain.toml. Installing pytsk3 separately (Step 2)
+# avoids this.

@@ -498,7 +498,9 @@ def open_image(path: str, progress_cb=None) -> Tuple[str, ImageFormat, Optional[
         f"Cannot read '{path}' directly (format: {fmt.name}, pytsk3={'yes' if _TSK_AVAILABLE else 'no'}).\n\n"
         f"Options:\n"
         f"  1) Install pytsk3:  pip install pytsk3\n"
-        f"     For E01 also:    pip install pyewf\n"
+        f"     For E01 (Linux): sudo apt-get install python3-libewf && "
+        f"cp /usr/lib/python3/dist-packages/pyewf*.so $(python -c \"import site; print(site.getsitepackages()[0])\")\n"
+        f"     For E01 (Windows): use Arsenal Image Mounter to mount as a drive letter\n"
         f"  2) Mount manually and pass the mount point:\n"
         f"{instructions}"
     )

@@ -70,10 +70,16 @@ Installs `pytsk3` (The Sleuth Kit) and `windowsprefetch` (MAM-compressed prefetc
 # System packages
 sudo apt-get install -y build-essential python3-dev ewf-tools ntfs-3g
 
-# Python extras (pytsk3)
-pip install ".[linux]"
+# Install pytsk3 first (before pip install .) to avoid a Rust rebuild conflict
+pip install pytsk3
+pip install .
 
-# pyscca (libscca) — prefetch parsing + MAM decompression (not on PyPI)
+# pyewf — E01 image support (not on PyPI)
+sudo apt-get install -y python3-libewf
+cp /usr/lib/python3/dist-packages/pyewf*.so \
+   $(python -c "import site; print(site.getsitepackages()[0])")
+
+# pyscca — prefetch MAM decompression (not on PyPI)
 sudo apt-get install -y python3-libscca
 cp /usr/lib/python3/dist-packages/pyscca*.so \
    $(python -c "import site; print(site.getsitepackages()[0])")
