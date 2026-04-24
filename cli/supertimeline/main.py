@@ -126,6 +126,26 @@ def run(root_path, output, format, workers, no_sort, discover_only, debug, recov
         console.print(f"[red bold]Cannot open image:[/red bold]\n{exc}")
         sys.exit(1)
 
+    had_tmp = orc.tmp_dir is not None
+    try:
+        _run_with_orchestrator(
+            orc, root_path, output, format, workers, no_sort,
+            discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep,
+            wall_start, max_workers,
+        )
+    finally:
+        if had_tmp:
+            with console.status("[dim]Cleaning up extracted files...[/dim]"):
+                orc.close()
+        else:
+            orc.close()
+
+
+def _run_with_orchestrator(
+    orc, root_path, output, format, workers, no_sort,
+    discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep,
+    wall_start, max_workers,
+):
     # Run info table — printed once after image opens so we have the format name
     info = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2))
     info.add_column(style="bold cyan",  no_wrap=True)

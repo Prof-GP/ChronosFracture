@@ -446,6 +446,10 @@ class Orchestrator:
         self.close()
 
     @property
+    def tmp_dir(self) -> Optional[str]:
+        return self._tmp_dir
+
+    @property
     def results(self) -> List[ParseResult]:
         return list(self._results)
 
