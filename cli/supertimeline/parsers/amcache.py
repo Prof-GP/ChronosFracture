@@ -100,6 +100,7 @@ def _parse_inventory_application_file(root_key, artifact_path: str) -> List[Dict
                 "source": "AMCACHE",
                 "artifact": "Amcache.hve InventoryApplicationFile",
                 "artifact_path": artifact_path,
+                "file_path": full_path,
                 "message": f"{full_path}{sha1_str}",
                 "is_fn_timestamp": False,
             })
@@ -140,6 +141,7 @@ def _parse_legacy_amcache(root_key, artifact_path: str) -> List[Dict[str, Any]]:
                     "source": "AMCACHE",
                     "artifact": "Amcache.hve Legacy",
                     "artifact_path": artifact_path,
+                    "file_path": full_path,
                     "message": f"{full_path}{sha1_str}",
                     "is_fn_timestamp": False,
                 })

@@ -63,8 +63,9 @@ fn read_u64_le(data: &[u8], off: usize) -> u64 {
     ])
 }
 
-/// Scan a buffer for USN V2 records. Returns (offset_after_last, events).
-fn scan_usn_records(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
+/// Scan a buffer for USN V2 records.
+/// Returns a Vec of (TimelineEvent, file_name) pairs so callers can emit file_path.
+fn scan_usn_records(data: &[u8], artifact_path: &str) -> Vec<(TimelineEvent, String)> {
     let mut events = Vec::new();
     let mut offset = 0usize;
 
@@ -108,22 +109,25 @@ fn scan_usn_records(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
         let kind = if is_dir { "Directory" } else { "File" };
         let reason_str = reasons_to_string(reasons);
 
-        events.push(TimelineEvent {
-            timestamp_ns: filetime_to_unix_ns(timestamp),
-            macb: "M".to_string(),
-            source: "$UsnJrnl:$J".to_string(),
-            artifact: "$UsnJrnl".to_string(),
-            artifact_path: artifact_path.to_string(),
-            message: format!("{} {} - {}", kind, file_name, reason_str),
-            hostname: None,
-            tz_offset_secs: 0,
-            is_fn_timestamp: false,
-            source_hash: None,
-            extra: Some(crate::types::EventExtra::Usn {
-                reasons:         reason_str.to_string(),
-                file_attributes: file_attrs,
-            }),
-        });
+        events.push((
+            TimelineEvent {
+                timestamp_ns: filetime_to_unix_ns(timestamp),
+                macb: "M".to_string(),
+                source: "$UsnJrnl:$J".to_string(),
+                artifact: "$UsnJrnl".to_string(),
+                artifact_path: artifact_path.to_string(),
+                message: format!("{} {} - {}", kind, file_name, reason_str),
+                hostname: None,
+                tz_offset_secs: 0,
+                is_fn_timestamp: false,
+                source_hash: None,
+                extra: Some(crate::types::EventExtra::Usn {
+                    reasons:         reason_str.to_string(),
+                    file_attributes: file_attrs,
+                }),
+            },
+            file_name,
+        ));
 
         offset += rec_len;
     }
@@ -143,13 +147,13 @@ pub fn parse_usnjrnl_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
     let chunk_size = 64 * 1024 * 1024usize;
     let data: &[u8] = &mmap;
 
-    let all_events: Vec<TimelineEvent> = data
+    let all_events: Vec<(TimelineEvent, String)> = data
         .par_chunks(chunk_size)
         .flat_map(|chunk| scan_usn_records(chunk, path))
         .collect();
 
     let list = PyList::empty_bound(py);
-    for ev in &all_events {
+    for (ev, file_name) in &all_events {
         let dict = PyDict::new_bound(py);
         dict.set_item("timestamp_ns", ev.timestamp_ns)?;
         dict.set_item("timestamp_iso", ev.timestamp_iso())?;
@@ -157,6 +161,7 @@ pub fn parse_usnjrnl_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
         dict.set_item("source", &ev.source)?;
         dict.set_item("artifact", &ev.artifact)?;
         dict.set_item("artifact_path", &ev.artifact_path)?;
+        dict.set_item("file_path", file_name.as_str())?;
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;
