@@ -480,12 +480,14 @@ def view(parquet_file, rows, artifact_type, grep):
     tbl.add_column("MACB",            style="yellow", no_wrap=True, width=6)
     tbl.add_column("Artifact",        style="green",  no_wrap=True)
     tbl.add_column("FN?",             style="red",    no_wrap=True, width=4)
+    tbl.add_column("File Path",       style="dim cyan", overflow="fold")
     tbl.add_column("Message",         style="white",  overflow="fold")
 
     iso_col      = display.column("timestamp_iso").to_pylist()
     macb_col     = display.column("macb").to_pylist()
     artifact_col = display.column("artifact").to_pylist()
     fn_col       = display.column("is_fn_timestamp").to_pylist()
+    fp_col       = display.column("file_path").to_pylist() if "file_path" in display.schema.names else [None] * len(display)
     msg_col      = display.column("message").to_pylist()
 
     for i in range(len(display)):
@@ -494,6 +496,7 @@ def view(parquet_file, rows, artifact_type, grep):
             str(macb_col[i] or ""),
             str(artifact_col[i] or ""),
             "[red]FN[/red]" if fn_col[i] else "",
+            str(fp_col[i] or ""),
             str(msg_col[i] or ""),
         )
     console.print(tbl)
