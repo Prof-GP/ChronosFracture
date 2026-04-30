@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-windows = ["windowsprefetch>=4.0.3", "pytsk3"]
+windows = ["windowsprefetch>=4.0.3", "pytsk3", "libewf-python"]
 linux   = ["pytsk3"]
 
 [project.scripts]

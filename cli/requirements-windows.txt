@@ -5,9 +5,13 @@
 #
 # This installs:
 #   pytsk3           — raw / E01 / VMDK / VHD image parsing (The Sleuth Kit)
+#   libewf-python    — E01 / EWF image support (installs the pyewf module)
 #   windowsprefetch  — MAM decompression for Windows 10/11 prefetch files
 #
-# For E01 images, Arsenal Image Mounter is often simpler than pytsk3:
+# Note: pyewf requires the Visual C++ Redistributable to be installed.
+#   Download: https://aka.ms/vs/17/release/vc_redist.x64.exe
+#
+# For E01 images, Arsenal Image Mounter is an alternative to pyewf:
 #   https://arsenalrecon.com/products/arsenal-image-mounter
 #   Mount the image as a drive letter, then:
 #   supertimeline run E:\ -o out.parquet
