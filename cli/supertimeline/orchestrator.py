@@ -215,6 +215,12 @@ def _dispatch_job(job: ArtifactJob) -> ParseResult:
             for ev in events:
                 ev["artifact_path"] = lpath
 
+    # Inject file_path for parsers that don't set it themselves (all except MFT,
+    # which resolves the full volume-relative path for every entry it emits).
+    for ev in events:
+        if not ev.get("file_path"):
+            ev["file_path"] = job.path
+
     return ParseResult(
         artifact_type=job.artifact_type,
         path=job.path,
