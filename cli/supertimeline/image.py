@@ -328,6 +328,22 @@ def _get_partition_offset(img_info) -> int:
     return 0
 
 
+def _windows_volume_device(path: str) -> Optional[str]:
+    """
+    If *path* is a Windows drive-letter mount (e.g. ``E:\\``, ``E:``), return
+    the raw volume device path (``\\\\.\\E:``) that pytsk3 can open directly
+    to access NTFS metadata files ($MFT, $UsnJrnl:$J) that are invisible to
+    normal Win32 file APIs.  Returns None on non-Windows or non-drive paths.
+    """
+    import sys
+    if sys.platform != "win32":
+        return None
+    stripped = path.rstrip("\\/")
+    if len(stripped) == 2 and stripped[1] == ":" and stripped[0].isalpha():
+        return f"\\\\.\\{stripped}"
+    return None
+
+
 def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
                                   progress_cb=None) -> Optional[str]:
     """
@@ -347,17 +363,33 @@ def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
         last_err = ""
 
         # ── EWF: must use pyewf bridge — pytsk3.Img_Info reads raw EWF ──────
-        if fmt == ImageFormat.EWF and _EWF_AVAILABLE:
+        if fmt == ImageFormat.EWF:
+            if not _EWF_AVAILABLE:
+                raise RuntimeError(
+                    "E01/EWF images require libewf-python.\n"
+                    "  Windows: pip install libewf-python\n"
+                    "  Linux:   sudo apt-get install python3-libewf\n\n"
+                    "Alternatively, mount the image with Arsenal Image Mounter and pass "
+                    "the drive letter to supertimeline."
+                )
             try:
                 ewf_path = image_path.replace("/", "\\") if sys.platform == "win32" else image_path
                 filenames = pyewf.glob(ewf_path)
+                if not filenames:
+                    raise RuntimeError(
+                        f"pyewf could not locate any EWF segments for: {ewf_path}\n"
+                        "Make sure all chunks (.E01, .E02, …) are in the same directory "
+                        "and that you are pointing at the first segment."
+                    )
                 ewf_handle = pyewf.handle()
                 ewf_handle.open(filenames)
                 img_info = _make_ewf_img_info(ewf_handle)
+            except RuntimeError:
+                raise
             except Exception as e:
                 last_err = str(e)
 
-        # ── Raw / VMDK / VHD: try pytsk3 direct ─────────────────────────────
+        # ── Raw / VMDK / VHD / live volume: try pytsk3 direct ───────────────
         if img_info is None and fmt != ImageFormat.EWF:
             try:
                 img_info = pytsk3.Img_Info(image_path)
@@ -365,7 +397,9 @@ def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
                 last_err = str(e)
 
         if img_info is None:
-            raise RuntimeError(f"Could not open image: {last_err}")
+            raise RuntimeError(
+                f"Could not open image: {last_err or '(unknown error)'}"
+            )
 
         # Find NTFS partition
         fs_offset = _get_partition_offset(img_info)
@@ -481,26 +515,51 @@ def open_image(path: str, progress_cb=None) -> Tuple[str, ImageFormat, Optional[
     fmt = detect_format(path)
 
     if fmt == ImageFormat.DIRECTORY:
+        # On Windows, NTFS metadata files ($MFT, $UsnJrnl:$J) are NOT accessible
+        # via normal Win32 paths, even on a mounted Arsenal Image Mounter volume.
+        # If pytsk3 is available, open the raw volume device (\\.\X:) instead so
+        # we can extract them alongside all other artifacts.
+        if _TSK_AVAILABLE:
+            raw_dev = _windows_volume_device(path)
+            if raw_dev:
+                try:
+                    tmp = extract_artifacts_from_image(
+                        raw_dev, ImageFormat.RAW, progress_cb=progress_cb
+                    )
+                    if tmp:
+                        return tmp, fmt, tmp
+                except Exception:
+                    # Raw device access failed — fall back to normal directory mode.
+                    # $MFT and $J will be missing but everything else still works.
+                    pass
         return path, fmt, None
 
     # Try direct extraction via pytsk3
     if _TSK_AVAILABLE and fmt in (ImageFormat.RAW, ImageFormat.EWF,
                                    ImageFormat.VMDK, ImageFormat.VHD,
                                    ImageFormat.VHDX):
-        tmp = extract_artifacts_from_image(path, fmt, progress_cb=progress_cb)
-        if tmp:
-            return tmp, fmt, tmp
+        try:
+            tmp = extract_artifacts_from_image(path, fmt, progress_cb=progress_cb)
+            if tmp:
+                return tmp, fmt, tmp
+        except RuntimeError:
+            raise   # propagate — already has a clear message
 
     # No pytsk3 or extraction failed — print mount instructions
     instructions = MOUNT_INSTRUCTIONS.get(fmt, "")
     instructions = instructions.format(path=path)
+    tsk_note = (
+        "     For E01 (Linux): sudo apt-get install python3-libewf\n"
+        "     For E01 (Windows): pip install libewf-python\n"
+        if fmt == ImageFormat.EWF else ""
+    )
     raise RuntimeError(
-        f"Cannot read '{path}' directly (format: {fmt.name}, pytsk3={'yes' if _TSK_AVAILABLE else 'no'}).\n\n"
+        f"Cannot read '{path}' directly (format: {fmt.name}, "
+        f"pytsk3={'yes' if _TSK_AVAILABLE else 'no'}, "
+        f"pyewf={'yes' if _EWF_AVAILABLE else 'no'}).\n\n"
         f"Options:\n"
         f"  1) Install pytsk3:  pip install pytsk3\n"
-        f"     For E01 (Linux): sudo apt-get install python3-libewf && "
-        f"cp /usr/lib/python3/dist-packages/pyewf*.so $(python -c \"import site; print(site.getsitepackages()[0])\")\n"
-        f"     For E01 (Windows): use Arsenal Image Mounter to mount as a drive letter\n"
+        f"{tsk_note}"
         f"  2) Mount manually and pass the mount point:\n"
         f"{instructions}"
     )
