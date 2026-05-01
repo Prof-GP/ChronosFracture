@@ -46,10 +46,46 @@ fn read_utf16_le(data: &[u8], off: usize, max_chars: usize) -> String {
 
 struct PrefetchRecord {
     exe_name: String,
+    exe_path: String,  // full path from Section C file name strings
     run_count: u32,
     last_run_times: Vec<u64>, // FILETIME values
     hash: u32,
     version: u8,
+}
+
+/// Read all null-terminated UTF-16LE strings from Section C (file name strings).
+fn read_section_c_strings(data: &[u8], sec_c_off: usize, sec_c_len: usize) -> Vec<String> {
+    let end = (sec_c_off + sec_c_len).min(data.len());
+    if sec_c_off >= data.len() || sec_c_len == 0 {
+        return vec![];
+    }
+    let sec = &data[sec_c_off..end];
+    let mut strings = Vec::new();
+    let mut i = 0;
+    while i + 1 < sec.len() {
+        let mut units: Vec<u16> = Vec::new();
+        while i + 1 < sec.len() {
+            let c = u16::from_le_bytes([sec[i], sec[i + 1]]);
+            i += 2;
+            if c == 0 { break; }
+            units.push(c);
+        }
+        if !units.is_empty() {
+            strings.push(String::from_utf16_lossy(&units).to_string());
+        }
+    }
+    strings
+}
+
+/// Find the full path for the main executable in the Section C string list.
+fn find_exe_path(strings: &[String], exe_name: &str) -> String {
+    let upper = exe_name.to_uppercase();
+    for s in strings {
+        if s.to_uppercase().ends_with(&upper) {
+            return s.clone();
+        }
+    }
+    strings.first().cloned().unwrap_or_default()
 }
 
 fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord> {
@@ -71,6 +107,13 @@ fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord>
     }
 
     let hash = read_u32_le(data, 76);
+
+    // Section C (file name strings) offset and length are at 0x64/0x68 in all versions.
+    let sec_c_off = read_u32_le(data, 0x64) as usize;
+    let sec_c_len = read_u32_le(data, 0x68) as usize;
+    let sec_c_strings = read_section_c_strings(data, sec_c_off, sec_c_len);
+    let exe_path = find_exe_path(&sec_c_strings, &exe_name);
+
     // Run count offset is version-specific.
     // V30 (Win10) / V26 (Win8): 0xD0 (confirmed against windowsprefetch).
     // V23 (Vista/7): single run time at 0x78, run count follows at 0x90.
@@ -112,6 +155,7 @@ fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord>
 
     Some(PrefetchRecord {
         exe_name,
+        exe_path,
         run_count,
         last_run_times,
         hash,
@@ -135,6 +179,7 @@ fn events_from_record(rec: PrefetchRecord, path_str: &str) -> Vec<TimelineEvent>
             source_hash:     None,
             extra: Some(EventExtra::Prefetch {
                 exe_name:      rec.exe_name.clone(),
+                exe_path:      rec.exe_path.clone(),
                 run_count:     rec.run_count,
                 prefetch_hash: format!("{:08X}", rec.hash),
                 version:       rec.version as u32,
@@ -197,8 +242,10 @@ pub fn parse_prefetch_bytes_decompressed(
         dict.set_item("message",         &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
-        if let Some(EventExtra::Prefetch { exe_name, run_count, .. }) = &ev.extra {
+        if let Some(EventExtra::Prefetch { exe_name, exe_path, run_count, .. }) = &ev.extra {
+            dict.set_item("file_path", if !exe_path.is_empty() { exe_path.as_str() } else { exe_name.as_str() })?;
             dict.set_item("exe_name",  exe_name.as_str())?;
+            dict.set_item("exe_path",  exe_path.as_str())?;
             dict.set_item("run_count", run_count)?;
         }
         list.append(dict)?;
@@ -240,8 +287,10 @@ pub fn parse_prefetch_dir(py: Python<'_>, dir_path: &str) -> PyResult<Py<PyList>
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;
-        if let Some(EventExtra::Prefetch { exe_name, run_count, .. }) = &ev.extra {
+        if let Some(EventExtra::Prefetch { exe_name, exe_path, run_count, .. }) = &ev.extra {
+            dict.set_item("file_path", if !exe_path.is_empty() { exe_path.as_str() } else { exe_name.as_str() })?;
             dict.set_item("exe_name",  exe_name.as_str())?;
+            dict.set_item("exe_path",  exe_path.as_str())?;
             dict.set_item("run_count", run_count)?;
         }
         list.append(dict)?;

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum EventExtra {
     Mft      { mft_entry: u64 },
     Evtx     { event_id: u32, channel: String, level: u8 },
-    Prefetch { exe_name: String, run_count: u32, prefetch_hash: String, version: u32 },
+    Prefetch { exe_name: String, exe_path: String, run_count: u32, prefetch_hash: String, version: u32 },
     Lnk      { target_path: String, drive_type: u32, drive_serial: String, volume_label: String },
     Usn      { reasons: String, file_attributes: u32 },
     JumpList { target_path: String, destlist_version: Option<u32> },

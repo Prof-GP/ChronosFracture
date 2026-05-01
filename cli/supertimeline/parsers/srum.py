@@ -11,10 +11,80 @@ Tables parsed:
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import struct
+import subprocess
+import sys
 from typing import List, Dict, Any, Optional
 
 log = logging.getLogger(__name__)
+
+
+def _ese_recover(db_path: str) -> bool:
+    """
+    Attempt ESE database recovery on a dirty-shutdown SRUDB.dat using esentutl
+    (Windows only).
+
+    Strategy:
+      1. Soft recovery  (/r) — replays transaction log files found in the same
+         directory.  This is the preferred path: it commits all pending
+         transactions without losing data.  The /i flag allows recovery even
+         when some log files are missing.
+      2. Hard repair    (/p) — patches corrupt/unreadable pages in place.
+         Used as a fallback when soft recovery fails (e.g. log files were not
+         extracted).  Some recent, uncommitted transactions may be lost.
+
+    Returns True if either step succeeded and the database should now be
+    readable, False if recovery is unavailable or both steps failed.
+    """
+    if sys.platform != "win32":
+        log.warning(
+            "SRUM: SRUDB.dat is in a dirty-shutdown state and requires esentutl "
+            "recovery, which is only available on Windows. "
+            "Copy the sru/ directory (including *.log files) to a Windows machine "
+            "and run: esentutl /r sru /i"
+        )
+        return False
+
+    esentutl = shutil.which("esentutl")
+    if not esentutl:
+        log.warning("SRUM: esentutl not found — cannot recover SRUDB.dat")
+        return False
+
+    db_dir = os.path.dirname(os.path.abspath(db_path))
+
+    # Step 1: soft recovery — replays log files in the same directory
+    try:
+        result = subprocess.run(
+            [esentutl, "/r", "sru", "/i", "/l", db_dir, "/s", db_dir],
+            capture_output=True, timeout=120, cwd=db_dir,
+        )
+        if result.returncode == 0:
+            log.info("SRUM: soft recovery succeeded for %s", db_path)
+            return True
+        log.debug("SRUM: soft recovery returned %d — %s",
+                  result.returncode, result.stderr.decode(errors="replace").strip())
+    except Exception as exc:
+        log.debug("SRUM: soft recovery error — %s", exc)
+
+    # Step 2: hard repair — patches pages without needing log files
+    try:
+        result = subprocess.run(
+            [esentutl, "/p", db_path, "/o"],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode == 0:
+            log.info("SRUM: hard repair succeeded for %s", db_path)
+            return True
+        log.warning("SRUM: hard repair failed (rc=%d) for %s — %s",
+                    result.returncode, db_path,
+                    result.stderr.decode(errors="replace").strip())
+    except Exception as exc:
+        log.warning("SRUM: hard repair error — %s", exc)
+
+    return False
+
 
 # GUID prefixes (uppercase, no braces) that identify each table
 _APP_TIMELINE_GUID = "D10CA2FE"
@@ -276,6 +346,7 @@ def _parse_app_timeline(table, id_map: Dict[int, str], srum_path: str) -> List[D
                 "source":          "SRUM",
                 "artifact":        "SRUM AppTimeline",
                 "artifact_path":   srum_path,
+                "file_path":       app_name,
                 "message":         "  |  ".join(msg_parts),
                 "is_fn_timestamp": False,
                 "tz_offset_secs":  0,
@@ -340,6 +411,7 @@ def _parse_network_usage(table, id_map: Dict[int, str], srum_path: str) -> List[
                 "source":          "SRUM",
                 "artifact":        "SRUM Network",
                 "artifact_path":   srum_path,
+                "file_path":       app_name,
                 "message":         "  |  ".join(msg_parts),
                 "is_fn_timestamp": False,
                 "tz_offset_secs":  0,
@@ -368,8 +440,15 @@ def parse(srum_path: str) -> List[Dict[str, Any]]:
     try:
         db = pyesedb.open(srum_path)
     except Exception as exc:
-        log.warning("SRUM: could not open %s — %s", srum_path, exc)
-        return []
+        log.warning("SRUM: could not open %s — %s — attempting ESE recovery", srum_path, exc)
+        if _ese_recover(srum_path):
+            try:
+                db = pyesedb.open(srum_path)
+            except Exception as exc2:
+                log.warning("SRUM: still cannot open after recovery — %s", exc2)
+                return []
+        else:
+            return []
 
     # Build ID resolution map first
     id_map = _build_id_map(db)

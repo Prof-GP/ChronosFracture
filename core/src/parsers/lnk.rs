@@ -218,6 +218,7 @@ fn event_to_dict<'py>(py: Python<'py>, ev: &TimelineEvent) -> PyResult<Bound<'py
     d.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
     d.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
     if let Some(EventExtra::Lnk { target_path, drive_type, drive_serial, volume_label }) = &ev.extra {
+        d.set_item("file_path",    target_path.as_str())?;
         d.set_item("target_path",  target_path.as_str())?;
         d.set_item("drive_type",   drive_type)?;
         d.set_item("drive_serial", drive_serial.as_str())?;
