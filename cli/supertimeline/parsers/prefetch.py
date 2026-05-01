@@ -129,12 +129,15 @@ def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
             events.append({
                 "timestamp_ns":    ts_ns,
                 "timestamp_iso":   ts_iso,
-                "macb":            "....",
+                "macb":            "M",
                 "source":          "PREFETCH",
-                "artifact":        "PREFETCH",
+                "artifact":        "Prefetch",
                 "artifact_path":   str(pf_path),
                 "file_path":       exe_path,
-                "message":         f"{exe_name} (run {i+1}/{run_count})",
+                "exe_name":        exe_name,
+                "exe_path":        exe_path,
+                "run_count":       run_count,
+                "message":         f"{exe_name} - Executed (run count: {run_count})",
                 "is_fn_timestamp": False,
                 "tz_offset_secs":  0,
             })
@@ -144,19 +147,68 @@ def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
         scca.close()
 
 
+def _decompress_via_ntdll(raw: bytes) -> tuple:
+    """Windows-only: decompress MAM via ntdll.RtlDecompressBufferEx.
+    Returns (decompressed_bytes, error_str). error_str is None on success."""
+    import ctypes
+    import struct
+    try:
+        if len(raw) < 8:
+            return b"", "file too short"
+        uncompressed_size = struct.unpack_from("<I", raw, 4)[0]
+        if not (0 < uncompressed_size <= 128 * 1024 * 1024):
+            return b"", f"invalid uncompressed_size={uncompressed_size}"
+        compressed = raw[8:]
+        out_buf    = ctypes.create_string_buffer(uncompressed_size)
+        final_size = ctypes.c_ulong(0)
+        workspace  = ctypes.create_string_buffer(65536)
+        ntdll      = ctypes.WinDLL("ntdll")
+        status = ntdll.RtlDecompressBufferEx(
+            0x0004,            # COMPRESSION_FORMAT_XPRESS_HUFF
+            out_buf,
+            uncompressed_size,
+            compressed,
+            len(compressed),
+            ctypes.byref(final_size),
+            workspace,
+        )
+        if status != 0:
+            return b"", f"NTSTATUS=0x{status & 0xFFFFFFFF:08X}"
+        if final_size.value == 0:
+            return b"", "final_size=0"
+        return bytes(out_buf.raw[:final_size.value]), None
+    except Exception as e:
+        return b"", f"{type(e).__name__}: {e}"
+
+
 def _decompress_mam_file(pf_path: Path, raw: bytes) -> bytes:
-    # Cross-platform: Rust native LZXPRESS Huffman decompressor (no OS deps).
-    # Tried first on all platforms; falls through to platform-specific paths on failure.
+    # Windows primary: direct ntdll call — OS-native, zero deps, most reliable.
+    # If ntdll can't decompress it, nothing can on Windows; skip further attempts.
+    if sys.platform == "win32":
+        result, err = _decompress_via_ntdll(raw)
+        if result:
+            return result
+        log.debug("MAM decompression skipped for %s (%s) — file likely corrupt or mid-write", pf_path.name, err)
+        return b""
+
+    # Non-Windows: Rust native LZXPRESS Huffman decompressor (no OS deps).
     if _RUST:
         try:
-            return bytes(_core.decompress_mam_py(raw))
+            result = bytes(_core.decompress_mam_py(raw))
+            if result:
+                return result
+            log.warning("Rust MAM decompression returned empty for %s", pf_path.name)
         except Exception as exc:
-            log.debug("Rust MAM decompression failed for %s: %s", pf_path.name, exc)
+            log.warning("Rust MAM decompression failed for %s: %s", pf_path.name, exc)
 
-    # Windows: windowsprefetch uses ntdll
+    # Windows fallback: windowsprefetch library
     try:
         from windowsprefetch.utils import DecompressWin10
-        return bytes(DecompressWin10().decompress(str(pf_path)))
+        result = bytes(DecompressWin10().decompress(str(pf_path)))
+        if result:
+            return result
+        log.warning("DecompressWin10 returned empty for %s", pf_path.name)
+        return b""
     except ImportError:
         pass
     except Exception as exc:
