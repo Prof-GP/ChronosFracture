@@ -98,6 +98,19 @@ def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
     try:
         exe_name  = scca.get_executable_filename() or pf_path.stem
         run_count = scca.get_run_count() or 0
+
+        # Find the full path for the main executable from Section C filenames.
+        exe_upper = exe_name.upper()
+        exe_path  = exe_name  # fallback to just the name
+        try:
+            for n in range(scca.get_number_of_filenames()):
+                fn = scca.get_filename(n) or ""
+                if fn.upper().endswith(exe_upper):
+                    exe_path = fn
+                    break
+        except Exception:
+            pass
+
         events    = []
 
         for i in range(8):
@@ -120,6 +133,7 @@ def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
                 "source":          "PREFETCH",
                 "artifact":        "PREFETCH",
                 "artifact_path":   str(pf_path),
+                "file_path":       exe_path,
                 "message":         f"{exe_name} (run {i+1}/{run_count})",
                 "is_fn_timestamp": False,
                 "tz_offset_secs":  0,

@@ -340,6 +340,22 @@ def _discover_from_extracted(root: str) -> List[ArtifactJob]:
                         is_directory=False,
                         logical_path=f"Windows\\System32\\winevt\\Logs\\{evtx_file.name}",
                     ))
+            elif artifact_type == "SRUM":
+                # Point the job at SRUDB.dat inside the extracted sru/ directory.
+                # Log files (sru*.log) sit alongside it so esentutl recovery works.
+                srudb = candidate / "SRUDB.dat"
+                if srudb.exists():
+                    try:
+                        size = srudb.stat().st_size
+                    except OSError:
+                        size = 0
+                    jobs.append(ArtifactJob(
+                        artifact_type="SRUM",
+                        path=str(srudb),
+                        size_bytes=size,
+                        is_directory=False,
+                        logical_path="Windows\\System32\\sru\\SRUDB.dat",
+                    ))
             else:
                 try:
                     size = sum(f.stat().st_size for f in candidate.rglob("*") if f.is_file())

@@ -136,7 +136,7 @@ _EXTRACT_TARGETS: Dict[str, str] = {
     "Windows/System32/config/SOFTWARE": "SOFTWARE",
     "Windows/System32/config/SAM":      "SAM",
     "Windows/System32/config/SECURITY": "SECURITY",
-    "Windows/System32/sru/SRUDB.dat":   "SRUDB.dat",
+    "Windows/System32/sru":              "sru",        # whole dir — log files needed for ESE recovery
     "Windows/AppCompat/Programs/Amcache.hve": "Amcache.hve",
     "Windows/appcompat/pca/PcaAppLaunchDic.txt": "PcaAppLaunchDic.txt",
     "Windows/appcompat/pca/PcaGeneralDb0.txt":   "PcaGeneralDb0.txt",
@@ -158,7 +158,7 @@ EXTRACTED_ARTIFACT_MAP: Dict[str, Tuple[str, bool]] = {
     "SOFTWARE":     ("REGISTRY",  False),
     "SAM":          ("REGISTRY",  False),
     "SECURITY":     ("REGISTRY",  False),
-    "SRUDB.dat":    ("SRUM",      False),
+    "sru":          ("SRUM",      True),
     "Amcache.hve":           ("AMCACHE",  False),
     "PcaAppLaunchDic.txt":   ("PCASVC",   False),
     "PcaGeneralDb0.txt":     ("PCASVC",   False),
@@ -411,7 +411,7 @@ def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
         _SPARSE_TARGETS = {"$Extend/$UsnJrnl:$J"}
 
         # Directories to recurse into
-        _DIR_TARGETS = {"Windows/System32/winevt/Logs", "Windows/Prefetch"}
+        _DIR_TARGETS = {"Windows/System32/winevt/Logs", "Windows/Prefetch", "Windows/System32/sru"}
 
         for src_path, dest_name in _EXTRACT_TARGETS.items():
             if progress_cb:

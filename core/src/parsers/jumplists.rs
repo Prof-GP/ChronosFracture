@@ -384,6 +384,7 @@ fn event_to_dict<'py>(py: Python<'py>, ev: &TimelineEvent) -> PyResult<Bound<'py
     d.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
     d.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
     if let Some(EventExtra::JumpList { target_path, destlist_version }) = &ev.extra {
+        d.set_item("file_path",   target_path.as_str())?;
         d.set_item("target_path", target_path.as_str())?;
         if let Some(v) = destlist_version {
             d.set_item("destlist_version", v)?;
