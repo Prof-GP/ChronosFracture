@@ -1,6 +1,7 @@
 """
 supertimeline — High-performance forensic super-timeline generator.
 """
+import logging
 import os
 import sys
 import time
@@ -96,7 +97,9 @@ def _banner():
               help="Carve zeroed $J streams for recovered USN records (fast)")
 @click.option("--recover-usnjrnl-deep", is_flag=True, default=False,
               help="Carve entire image for USN records including unallocated space (slow)")
-def run(root_path, output, format, workers, no_sort, discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep):
+@click.option("--verbose", "-v", is_flag=True, default=False,
+              help="Show parser warnings and errors (enables logging)")
+def run(root_path, output, format, workers, no_sort, discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep, verbose):
     """
     Generate a forensic super-timeline from ROOT_PATH.
 
@@ -110,6 +113,10 @@ def run(root_path, output, format, workers, no_sort, discover_only, debug, recov
       supertimeline /mnt/image -f jsonl -o events.jsonl
       supertimeline C:\\ --discover-only
     """
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(levelname)s  %(name)s  %(message)s",
+    )
     _banner()
     wall_start  = time.perf_counter()
     max_workers = workers if workers > 0 else os.cpu_count()

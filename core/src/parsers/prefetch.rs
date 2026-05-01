@@ -119,15 +119,15 @@ fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord>
     // V23 (Vista/7): single run time at 0x78, run count follows at 0x90.
     // V17 (XP): run count at 0x90.
     let run_count = match version {
-        0x1A | 0x1E => read_u32_le(data, 0xD0), // V26/V30
-        _           => read_u32_le(data, 0x90),  // V17/V23 fallback
+        0x1A | 0x1E | 0x1F => read_u32_le(data, 0xD0), // V26/V30/V31
+        _                   => read_u32_le(data, 0x90),  // V17/V23 fallback
     };
 
     // Last run times depend on version:
     // V17 (XP): single timestamp at offset 80
     // V23 (7):  single timestamp at offset 0x78
     // V26 (8):  8 timestamps at offset 0x80
-    // V30 (10): 8 timestamps at offset 0x80
+    // V30 (Win10) / V31 (Win11): 8 timestamps at offset 0x80
     let mut last_run_times = Vec::new();
 
     match version {
@@ -139,10 +139,9 @@ fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord>
             last_run_times.push(read_u64_le(data, 0x78));
         }
         0x17 => {}
-        0x1A | 0x1E => { // V26/V30 - Win8/10 - up to 8 run times
-            let base = if version == 0x1A { 0x80 } else { 0x80 };
+        0x1A | 0x1E | 0x1F => { // V26/V30/V31 - Win8/10/11 - up to 8 run times
             for i in 0..8usize {
-                let off = base + i * 8;
+                let off = 0x80 + i * 8;
                 if off + 8 > data.len() { break; }
                 let ft = read_u64_le(data, off);
                 if ft > 0 {
