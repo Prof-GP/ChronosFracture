@@ -256,6 +256,10 @@ fn is_noise_string(s: &str) -> bool {
     {
         return true;
     }
+    // Channel-name fragments from odd-alignment reads (e.g. "indows-Security-Auditing")
+    if s.contains("-Security-Auditing") || s.contains("-Windows-Security") {
+        return true;
+    }
     false
 }
 
@@ -448,6 +452,44 @@ fn extract_ps_snippet(data: &[u8]) -> Option<String> {
     None
 }
 
+/// Generic snippet extractor for all event IDs without a specific handler.
+/// Returns the longest meaningful UTF-16LE string found in the BinXML payload.
+fn extract_generic_snippet(data: &[u8]) -> Option<String> {
+    let scan_start = 0xC0usize.min(data.len());
+    let mut best_s: Option<String> = None;
+    let mut best_len = 0usize;
+    let mut i = scan_start;
+
+    while i + 1 < data.len() {
+        let lo = data[i];
+        let hi = data[i + 1];
+        if hi != 0 || lo < 0x20 {
+            i += 1;
+            continue;
+        }
+        let (len, end) = measure_utf16le_run(data, i);
+        if len >= 6 {
+            if let Some(s) = extract_utf16le_str(data, i, len.min(240)) {
+                if !is_noise_string(&s) && len > best_len {
+                    best_len = len;
+                    best_s = Some(s);
+                }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    best_s.map(|s| {
+        if s.len() > 120 {
+            format!("{}...", &s[..120])
+        } else {
+            s
+        }
+    })
+}
+
 /// Parse an event record from within a chunk's event records area.
 /// This is a simplified extraction — pulls timestamp, EventID, Channel, Computer.
 fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
@@ -507,13 +549,20 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
         _ => None,
     };
 
+    // Generic snippet for events without a specific handler
+    let generic_snippet = if ps_snippet.is_none() && logon_snippet.is_none() {
+        extract_generic_snippet(data)
+    } else {
+        None
+    };
+
     let base = match (event_name(event_id), channel.is_empty()) {
         (Some(name), false) => format!("EventID {} - {} [{}]", event_id, name, channel),
         (Some(name), true)  => format!("EventID {} - {}", event_id, name),
         (None, false)       => format!("EventID {} [{}]", event_id, channel),
         (None, true)        => format!("EventID {}", event_id),
     };
-    let message = if let Some(snippet) = ps_snippet.or(logon_snippet) {
+    let message = if let Some(snippet) = ps_snippet.or(logon_snippet).or(generic_snippet) {
         format!("{} | {}", base, snippet)
     } else {
         base
@@ -599,7 +648,6 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
                 macb: "M".to_string(),
                 source: "EVTX".to_string(),
                 artifact: "Windows Event Log".to_string(),
-                artifact_path: artifact_path.to_string(),
                 message: rec.message,
                 hostname: if rec.computer.is_empty() { None } else { Some(rec.computer) },
                 tz_offset_secs: 0,
@@ -654,7 +702,6 @@ pub fn parse_evtx_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
         dict.set_item("macb", &ev.macb)?;
         dict.set_item("source", &ev.source)?;
         dict.set_item("artifact", &ev.artifact)?;
-        dict.set_item("artifact_path", &ev.artifact_path)?;
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;

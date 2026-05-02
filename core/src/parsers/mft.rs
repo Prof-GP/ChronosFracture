@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -105,7 +105,7 @@ fn parse_utf16_name(data: &[u8], offset: usize, len_units: usize) -> String {
 /// Group four MACB timestamps into deduplicated events.
 fn build_macb_events(
     timestamps: [u64; 4],
-    artifact_path: &str,
+    _artifact_path: &str,
     source: &str,
     artifact: &str,
     file_name: &str,
@@ -145,7 +145,6 @@ fn build_macb_events(
                 macb,
                 source: source.to_string(),
                 artifact: artifact.to_string(),
-                artifact_path: artifact_path.to_string(),
                 message: file_name.to_string(),
                 hostname: None,
                 tz_offset_secs: 0,
@@ -358,7 +357,6 @@ pub fn parse_mft_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
         dict.set_item("macb", &ev.macb)?;
         dict.set_item("source", &ev.source)?;
         dict.set_item("artifact", &ev.artifact)?;
-        dict.set_item("artifact_path", &ev.artifact_path)?;
         dict.set_item("file_path", file_path)?;
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
@@ -367,6 +365,41 @@ pub fn parse_mft_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
     }
 
     Ok(list.into())
+}
+
+/// Build a {entry_num: full_path} dict from an extracted $MFT file.
+/// Used by the USN journal parser to resolve parent FRNs to directory paths.
+#[pyfunction]
+pub fn build_mft_path_map(py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
+    let file = File::open(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+    let total_entries = mmap.len() / MFT_ENTRY_SIZE;
+
+    let raw_entries: Vec<RawEntryData> = (0..total_entries)
+        .into_par_iter()
+        .filter_map(|i| {
+            let start = i * MFT_ENTRY_SIZE;
+            let end   = start + MFT_ENTRY_SIZE;
+            if end > mmap.len() { return None; }
+            parse_mft_entry_raw(&mmap[start..end], i as u64)
+        })
+        .collect();
+
+    let name_map: HashMap<u64, (String, u64)> = raw_entries
+        .iter()
+        .map(|e| (e.entry_index, (e.name.clone(), e.parent_entry)))
+        .collect();
+
+    let dict = PyDict::new_bound(py);
+    for entry in &raw_entries {
+        let path_str = resolve_path(entry.entry_index, &name_map);
+        dict.set_item(entry.entry_index, path_str)?;
+    }
+
+    Ok(dict.into())
 }
 
 #[pyclass]

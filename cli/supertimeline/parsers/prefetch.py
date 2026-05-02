@@ -132,7 +132,6 @@ def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
                 "macb":            "M",
                 "source":          "PREFETCH",
                 "artifact":        "Prefetch",
-                "artifact_path":   str(pf_path),
                 "file_path":       exe_path,
                 "exe_name":        exe_name,
                 "exe_path":        exe_path,

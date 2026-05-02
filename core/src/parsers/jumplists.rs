@@ -208,7 +208,7 @@ impl<'a> Cfb<'a> {
 ///   v4 (Win10+):  FILETIME at 0x64, path_len(u16) at 0x82, path at 0x84
 ///
 /// Entry advancement: fixed_path_offset + 2 (path_len u16) + path_len * 2 + 2 (null)
-fn parse_destlist(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
+fn parse_destlist(data: &[u8], _artifact_path: &str) -> Vec<TimelineEvent> {
     if data.len() < 32 { return Vec::new(); }
 
     let version     = r_u32(data, 0);
@@ -221,7 +221,7 @@ fn parse_destlist(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
         4 => (0x64usize, 0x82usize, 0x84usize),
         // Unknown version: scan for FILETIME in first 200 bytes then adjacent path
         _ => {
-            return parse_destlist_scan(data, artifact_path, num_entries);
+            return parse_destlist_scan(data, _artifact_path, num_entries);
         }
     };
     let (ft_off, pl_off, path_off) = layout;
@@ -247,7 +247,6 @@ fn parse_destlist(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
                 macb:            "A".to_string(),
                 source:          "JUMPLIST".to_string(),
                 artifact:        "JumpList".to_string(),
-                artifact_path:   artifact_path.to_string(),
                 message:         format!("JumpList accessed: {}", target),
                 hostname:        None,
                 tz_offset_secs:  0,
@@ -268,7 +267,7 @@ fn parse_destlist(data: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
 
 /// Fallback DestList parser for unknown versions: scan for valid FILETIME values
 /// followed by a uint16 length-prefixed UTF-16LE string.
-fn parse_destlist_scan(data: &[u8], artifact_path: &str, max_entries: usize) -> Vec<TimelineEvent> {
+fn parse_destlist_scan(data: &[u8], _artifact_path: &str, max_entries: usize) -> Vec<TimelineEvent> {
     // Valid FILETIME range: year 2000 to 2040
     const MIN_FT: u64 = 125_911_584_000_000_000;
     const MAX_FT: u64 = 137_919_648_000_000_000;
@@ -292,8 +291,7 @@ fn parse_destlist_scan(data: &[u8], artifact_path: &str, max_entries: usize) -> 
                             macb:            "A".to_string(),
                             source:          "JUMPLIST".to_string(),
                             artifact:        "JumpList".to_string(),
-                            artifact_path:   artifact_path.to_string(),
-                            message:         format!("JumpList accessed: {}", s),
+                                        message:         format!("JumpList accessed: {}", s),
                             hostname:        None,
                             tz_offset_secs:  0,
                             is_fn_timestamp: false,
@@ -379,7 +377,6 @@ fn event_to_dict<'py>(py: Python<'py>, ev: &TimelineEvent) -> PyResult<Bound<'py
     d.set_item("macb",            &ev.macb)?;
     d.set_item("source",          &ev.source)?;
     d.set_item("artifact",        &ev.artifact)?;
-    d.set_item("artifact_path",   &ev.artifact_path)?;
     d.set_item("message",         &ev.message)?;
     d.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
     d.set_item("tz_offset_secs",  ev.tz_offset_secs)?;

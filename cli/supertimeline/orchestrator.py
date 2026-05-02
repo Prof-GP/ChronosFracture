@@ -185,7 +185,7 @@ def discover_artifacts(root: str) -> List[ArtifactJob]:
 
 # ── Parser dispatch ───────────────────────────────────────────────────────────
 
-def _dispatch_job(job: ArtifactJob) -> ParseResult:
+def _dispatch_job(job: ArtifactJob, mft_path_map=None) -> ParseResult:
     """
     Run the appropriate parser for one artifact.
     Any exception is caught and stored in ParseResult.error.
@@ -197,23 +197,12 @@ def _dispatch_job(job: ArtifactJob) -> ParseResult:
 
     try:
         if RUST_AVAILABLE:
-            events = _dispatch_rust(job)
+            events = _dispatch_rust(job, mft_path_map)
         else:
             events = _dispatch_python(job)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         log.warning("Parser error [%s] %s — %s", job.artifact_type, job.path, error)
-
-    # Remap temp extraction paths to evidence-relative logical paths
-    if job.logical_path and events:
-        lpath = job.logical_path
-        if job.is_directory:
-            for ev in events:
-                fname = Path(ev.get("artifact_path", "")).name
-                ev["artifact_path"] = f"{lpath}\\{fname}" if fname else lpath
-        else:
-            for ev in events:
-                ev["artifact_path"] = lpath
 
     # Inject file_path for parsers that don't set it themselves.
     # Priority: parser-set value > structured extras > source artifact path.
@@ -237,12 +226,12 @@ def _dispatch_job(job: ArtifactJob) -> ParseResult:
     )
 
 
-def _dispatch_rust(job: ArtifactJob) -> List[Dict[str, Any]]:
+def _dispatch_rust(job: ArtifactJob, mft_path_map=None) -> List[Dict[str, Any]]:
     if job.artifact_type == "MFT":
         return list(_core.parse_mft_file(job.path))
 
     if job.artifact_type == "USNJRNL":
-        return list(_core.parse_usnjrnl_file(job.path))
+        return list(_core.parse_usnjrnl_file(job.path, mft_path_map))
 
     if job.artifact_type == "EVTX":
         return list(_core.parse_evtx_file(job.path))
@@ -436,9 +425,25 @@ class Orchestrator:
         if not self._jobs:
             self.discover()
 
+        # Build MFT path map before parallel dispatch so USN journal entries
+        # get full paths resolved from their parent directory FRNs.
+        mft_path_map = None
+        if RUST_AVAILABLE:
+            mft_jobs = [j for j in self._jobs if j.artifact_type == "MFT"]
+            usn_jobs  = [j for j in self._jobs if j.artifact_type == "USNJRNL"]
+            if mft_jobs and usn_jobs:
+                try:
+                    mft_path_map = _core.build_mft_path_map(mft_jobs[0].path)
+                    log.debug("MFT path map built: %d entries", len(mft_path_map))
+                except Exception as exc:
+                    log.debug("Could not build MFT path map: %s", exc)
+
+        import functools
+        dispatch_fn = functools.partial(_dispatch_job, mft_path_map=mft_path_map)
+
         # Rust parsers release the GIL — ThreadPoolExecutor gives true parallelism
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futures = {pool.submit(_dispatch_job, job): job for job in self._jobs}
+            futures = {pool.submit(dispatch_fn, job): job for job in self._jobs}
 
             for future in concurrent.futures.as_completed(futures):
                 try:

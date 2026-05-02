@@ -223,7 +223,6 @@ def _parse_mft_record(data: bytes, artifact_path: str) -> List[Dict[str, Any]]:
             "macb": macb,
             "source": "LOGFILE",
             "artifact": "$LogFile MFT Record",
-            "artifact_path": artifact_path,
             "message": f"{'[DIR] ' if is_dir else ''}{fn_name}",
             "is_fn_timestamp": True,
         })
@@ -260,7 +259,6 @@ def _parse_file_name_from_data(data: bytes, artifact_path: str, op_label: str) -
             "macb": label,
             "source": "LOGFILE",
             "artifact": f"$LogFile {op_label}",
-            "artifact_path": artifact_path,
             "message": fn_name,
             "is_fn_timestamp": True,
         })
