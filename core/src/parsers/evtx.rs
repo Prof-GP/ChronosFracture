@@ -38,7 +38,7 @@ struct EvtxRecord {
     event_id: u32,
     channel: String,
     computer: String,
-    message: String,
+    snippet: Option<String>,  // extra context appended after base message
     level: u8,
 }
 
@@ -243,21 +243,93 @@ fn extract_utf16le_str(data: &[u8], start: usize, max_chars: usize) -> Option<St
     }
 }
 
+/// Safely truncate a string to at most `max_chars` Unicode characters.
+/// Uses char boundaries — never panics on multi-byte sequences.
+fn safe_trunc(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        None    => s.to_string(),
+        Some((i, _)) => format!("{}...", &s[..i]),
+    }
+}
+
 /// Return true if a string should be skipped when looking for meaningful content.
 fn is_noise_string(s: &str) -> bool {
     // GUIDs: 36 chars, 4 hyphens
     if s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4 {
         return true;
     }
+    // XML namespace URIs and any URL — includes partial reads like "5http://..."
+    if s.contains("://") {
+        return true;
+    }
     // Provider / channel names
     if s.starts_with("Microsoft-Windows-") || s.starts_with("Microsoft-")
         || s.starts_with("PowerShell") || s.starts_with("Windows PowerShell")
-        || s.starts_with("http://") || s.starts_with("https://")
     {
         return true;
     }
-    // Channel-name fragments from odd-alignment reads (e.g. "indows-Security-Auditing")
-    if s.contains("-Security-Auditing") || s.contains("-Windows-Security") {
+    // Single-word Windows event log channel names + common Windows non-username strings
+    if matches!(s, "Security" | "System" | "Application" | "Setup" | "ForwardedEvents"
+        | "Windows" | "System32" | "SysWOW64" | "Microsoft"
+        | "soft" | "osoft" | "rosoft" | "Type" | "Cryp" | "Crypt")
+    {
+        return true;
+    }
+    // Channel-name and provider-name fragments from odd-alignment reads.
+    // These appear when the BinXML template is stored inline in the record and the scanner
+    // reads into the provider name "Microsoft-Windows-Security-Auditing" at a non-zero offset.
+    if s.contains("-Security-Auditing") || s.contains("Security-Auditing")
+        || s.contains("-Windows-Security") || s.contains("icrosoft-")
+        || s.contains("-Windows-") || s.contains("AUTHORITY")
+    {
+        return true;
+    }
+    // BinXML element/attribute names that appear in inline template definitions.
+    // These are field name labels, not data values, so they must never become snippets.
+    static FIELD_NAMES: &[&str] = &[
+        "Provider", "EventID", "Version", "Level", "Task", "Opcode",
+        "Keywords", "TimeCreated", "SystemTime", "EventRecordID",
+        "Correlation", "ActivityID", "RelatedActivityID",
+        "Execution", "ProcessID", "ThreadID", "Channel", "Computer",
+        "EventData", "BinaryData", "UserData", "RenderingInfo",
+        "SubjectUserSid", "SubjectUserName", "SubjectDomainName", "SubjectLogonId",
+        "TargetUserSid", "TargetUserName", "TargetDomainName", "TargetLogonId",
+        "TargetOutboundUserName", "TargetOutboundDomainName",
+        "LogonType", "LogonProcessName", "AuthenticationPackageName", "LogonGuid",
+        "WorkstationName", "IpAddress", "IpPort", "TransmittedServices",
+        "LmPackageName", "KeyLength", "ImpersonationLevel", "VirtualAccount",
+        "LinkedLogonId", "ElevatedToken", "TokenElevationType", "MandatoryLabel",
+        "CallerProcessId", "CallerProcessName", "ProcessName", "ProcessPath",
+        "ObjectServer", "ObjectType", "ObjectName", "HandleId", "ResourceAttributes",
+        "ServiceName", "ServiceFileName", "ServiceType", "ServiceStartType",
+        "ServiceAccount", "TaskName", "TaskContent", "TaskContentNew",
+        "AccountName", "AccountDomain", "OldAccountName", "NewAccountName",
+        "GroupName", "GroupSid", "GroupType", "SidHistory",
+        "UserSid", "UserName", "DomainName", "Qualifiers",
+        "PackageName", "TokenType", "PrivilegeList", "ShareName", "ShareLocalPath",
+        "Application", "Direction", "SourceAddress", "SourcePort",
+        "DestAddress", "DestPort", "Protocol",
+        "QueryName", "QueryType", "QueryResults", "QueryStatus",
+        "ScriptBlockText", "ScriptBlockId", "MessageNumber", "MessageTotal",
+        "Path", "Param1", "Param2", "Param3", "Param4", "Param5",
+        "Param6", "Param7", "Param8",
+        "Name", "Guid", "Value",
+        "TargetLogonGuid", "LogonGuid", "SubjectLogonGuid",
+        "DeviceVersionMajor", "DeviceVersionMinor",
+        "OperationTime", "OperationTime_msecs",
+        "ErrorCode", "ResultCode", "StatusCode",
+        "hc_stateid", "TaskId", "TaskContent", "TaskName",
+        "TargetVolumeGuid", "VolumeGuid",
+        "RuleId", "RuleName", "FilterId",
+        "TargetServerName", "TargetInfo", "TargetDomainSid",
+        "TargetLinkedLogonId", "TargetLogonId", "SubjectLinkedLogonId",
+        "FailureReason", "SubStatus", "FailedApplication",
+        "RestrictedAdminMode", "RemoteCredentialGuard",
+        "ElevatedToken", "VirtualAccount", "AuditPolicyChanges",
+        "CategoryId", "SubcategoryId", "SubcategoryGuid",
+        "PrivilegeList",
+    ];
+    if FIELD_NAMES.contains(&s) {
         return true;
     }
     false
@@ -296,15 +368,18 @@ fn scan_for_channel(data: &[u8]) -> String {
         let (len, end) = measure_utf16le_run(data, i);
         if len >= 4 {
             if let Some(s) = extract_utf16le_str(data, i, 100) {
-                if s.starts_with("Security") || s.starts_with("System")
-                    || s.starts_with("Application") || s.starts_with("Microsoft-")
-                    || s.starts_with("Windows ") || s.starts_with("PowerShell")
-                    || s.contains('/') || s.contains('%')
-                {
-                    return s;
-                }
-                if best.is_none() || s.len() > best.as_ref().map_or(0, |b| b.len()) {
-                    best = Some(s);
+                // Skip XML namespace URIs — they appear in every EVTX record and are not channel names
+                if !s.contains("://") {
+                    if s.starts_with("Security") || s.starts_with("System")
+                        || s.starts_with("Application") || s.starts_with("Microsoft-")
+                        || s.starts_with("Windows ") || s.starts_with("PowerShell")
+                        || (s.contains('/') && !s.contains("://")) || s.contains('%')
+                    {
+                        return s;
+                    }
+                    if best.is_none() || s.len() > best.as_ref().map_or(0, |b| b.len()) {
+                        best = Some(s);
+                    }
                 }
             }
             i = end + 1; // step past this string (+ 1 for null terminator lo byte)
@@ -336,16 +411,66 @@ fn logon_type_name(t: u32) -> &'static str {
 ///   TargetUserSid,  TargetUserName,  TargetDomainName,  TargetLogonId, LogonType, ...
 /// We skip SYSTEM/NT AUTHORITY so the first remaining UTF-16LE string is TargetUserName.
 fn extract_logon_snippet(data: &[u8]) -> Option<String> {
-    // Skip EVTX record header (0x18) + BinXML system values (~0xA8) + channel/computer strings
+    // Skip EVTX record header (0x18) + BinXML system values (~0xA8) + channel/computer strings.
+    // For records that include an inline template definition (first occurrence of an event type
+    // in a chunk), the template can push the substitution data well past 0xC0.  Starting at
+    // 0xC0 is still the right place for subsequent records; for template-containing records,
+    // the field-name noise filter below takes care of false positives.
     let scan_start = 0xC0usize.min(data.len());
 
     static SKIP_ACCTS: &[&str] = &[
         "SYSTEM", "-", "NT AUTHORITY", "ANONYMOUS LOGON",
-        "LOCAL SERVICE", "NETWORK SERVICE", "Window Manager", "DWM-1",
+        "LOCAL SERVICE", "NETWORK SERVICE", "Window Manager",
+        "WORKGROUP", "NULL SID", "Everyone",
+        // Desktop Window Manager / User Mode Frame Driver service accounts
+        "DWM-1", "DWM-2", "DWM-3", "DWM-4", "DWM-5",
+        "UMFD-0", "UMFD-1", "UMFD-2", "UMFD-3", "UMFD-4",
+        // LogonProcessName values (not usernames)
+        "Advapi", "User32", "Schannel", "NtLmSsp",
+        "MICROSOFT_AUTHENTICATION_PACKAGE_V1_0",
+        // Common non-account strings that appear near usernames in BinXML
+        "Status", "ProcessId", "SubStatus",
+        // Authentication package / method names
+        "Negotiate", "Kerberos", "NTLM", "NtLmSsp",
+        // Logon control / flag strings
+        "RestrictedAdminMode", "RemoteCredentialGuard",
+        "localhost", "Font Driver Host",
+        // Partial reads of "Microsoft" at non-zero alignment
+        "Microsoft", "icrosoft",
+        // Common Windows path/API components that are not usernames
+        "Windows", "System32", "SysWOW64", "System",
+        // Known 4-char noise fragments from BinXML template areas
+        "soft", "osoft", "rosoft", "Type", "Cryp", "Crypt", "Info",
+        // Fragments of "DESKTOP-*" machine names at odd alignment
+        "KTOP", "SKTO", "ESKTO", "DESKTO",
+        // Fragment of "WORKGROUP"
+        "ORKG", "WORK", "ROUP", "GROU",
+        // Fragment of "Windows"
+        "Wind",
+        // Fragments of "AUTHORITY" at various alignments
+        "AUTH", "UTHO", "THOR", "HORI", "ORIT", "RITY",
+        // Fragments of "SECURITY"
+        "SECU", "ECUR", "CURI", "URIT",
+        // Fragments of "Privilege" / privilege names
+        "Priv", "PRIV", "Buil",
+        // BinXML structural artifacts that appear as 4-char UTF-16LE at record boundaries
+        "Envi", "ECDS", "ECDC",
+        // Fragments of "Read", "Target", "Return" etc.
+        "Read", "Targ", "Retu",
+        // Known .exe fragments
+        "Exec",
     ];
 
-    // Collect UTF-16LE string candidates with their end-byte position
-    let mut candidates: Vec<(String, usize)> = Vec::new();
+    // Privilege names: Windows SE* privilege tokens — never usernames.
+    // Covers both the full form (SeAssignPrimaryTokenPrivilege) and display form
+    // (AssignPrimaryTokenPrivilege with "Se" stripped).
+    let is_privilege = |s: &str| -> bool {
+        (s.starts_with("Se") && s.len() > 8 && s.chars().all(|c| c.is_ascii_alphanumeric()))
+            || s.ends_with("Privilege")
+    };
+
+    // Collect UTF-16LE string candidates
+    let mut candidates: Vec<String> = Vec::new();
     let mut i = scan_start;
     while i + 1 < data.len() {
         let lo = data[i];
@@ -355,17 +480,46 @@ fn extract_logon_snippet(data: &[u8]) -> Option<String> {
             continue;
         }
         let (len, end) = measure_utf16le_run(data, i);
-        if (2..=48).contains(&len) {
+        if (4..=48).contains(&len) {
             if let Some(s) = extract_utf16le_str(data, i, len) {
+                // For 4–5 char strings, require they start with uppercase — lowercase
+                // start chars almost always indicate a word fragment from BinXML template
+                // data (e.g. "icro" from "Microsoft", "vile" from "Privilege").
+                let is_short_fragment = len <= 5
+                    && s.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false);
+                // Short strings containing '-': fragments of machine names / provider strings.
+                let short_with_hyphen = len <= 5 && s.contains('-');
+                // Short strings with space: fragments like "NT A", "T AU" from "NT AUTHORITY".
+                let short_with_space = len <= 5 && s.contains(' ');
+                // Short strings starting with '.' or containing '.' at length ≤4:
+                // these are process-name fragments (".exe", "VC.e") not usernames.
+                let starts_dot = s.starts_with('.') || (len <= 4 && s.contains('.'));
+                // Short strings that mix letters and digits at length ≤4 are machine-name
+                // fragments (e.g. "C2N5" from "DESKTOP-SC2N5CT").
+                let short_mixed_alnum = len <= 4
+                    && s.chars().any(|c| c.is_ascii_digit())
+                    && s.chars().any(|c| c.is_ascii_alphabetic());
+                // IPv4 addresses: start with digit and contain 2+ dots
+                let is_ip = s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    && s.chars().filter(|c| *c == '.').count() >= 2;
                 let skip = SKIP_ACCTS.iter().any(|n| s.eq_ignore_ascii_case(n))
                     || s.starts_with("S-1-")
                     || is_noise_string(&s)
+                    || is_privilege(&s)
+                    || is_short_fragment
+                    || short_with_hyphen
+                    || short_with_space
+                    || starts_dot
+                    || short_mixed_alnum
+                    || is_ip
                     || s.contains('\\')
                     || s.contains('/')
                     || s.ends_with('$')
+                    || s.trim() != s  // leading/trailing whitespace → field value artifact
+                    || s.chars().all(|c| c.is_ascii_digit())  // pure numbers = IDs, not usernames
                     || s.chars().any(|c| !c.is_ascii_alphanumeric() && !"._- @".contains(c));
                 if !skip {
-                    candidates.push((s, end));
+                    candidates.push(s);
                 }
                 i = end;
                 continue;
@@ -374,14 +528,9 @@ fn extract_logon_snippet(data: &[u8]) -> Option<String> {
         i += 1;
     }
 
-    // First candidate = TargetUserName (Subject names filtered as SYSTEM/NT AUTHORITY)
-    let (username, name_end) = candidates.into_iter().next()?;
-
-    // Scan for logon type: uint32 little-endian with value [2,11] and upper 2 bytes == 0
-    // Start just after where we found the username
+    // Scan the full record for a logon type integer [2..11] in the bytes
     let mut logon_type: Option<u32> = None;
-    let type_scan = name_end.min(data.len());
-    let mut j = type_scan;
+    let mut j = scan_start;
     while j + 4 <= data.len() {
         let lo = u16::from_le_bytes([data[j], data[j + 1]]) as u32;
         let hi = u16::from_le_bytes([data[j + 2], data[j + 3]]) as u32;
@@ -392,9 +541,26 @@ fn extract_logon_snippet(data: &[u8]) -> Option<String> {
         j += 1;
     }
 
+    if candidates.is_empty() {
+        // No account candidates — return logon type if found (prevents generic fallback
+        // from surfacing unrelated strings like C:\Windows\System32\services.exe)
+        return logon_type.map(|t| format!("Type {} ({})", t, logon_type_name(t)));
+    }
+
+    // Format: LogonType | Account: first | Target: second (when two distinct accounts present)
+    let account = candidates[0].clone();
+    let target  = candidates.get(1)
+        .filter(|t| t.as_str() != account.as_str())
+        .cloned();
+
+    let acct_part = match target {
+        Some(t) => format!("Account: {} | Target: {}", account, t),
+        None    => format!("Account: {}", account),
+    };
+
     Some(match logon_type {
-        Some(t) => format!("Type {} ({}) | Account: {}", t, logon_type_name(t), username),
-        None    => format!("Account: {}", username),
+        Some(t) => format!("Type {} ({}) | {}", t, logon_type_name(t), acct_part),
+        None    => acct_part,
     })
 }
 
@@ -434,18 +600,12 @@ fn extract_ps_snippet(data: &[u8]) -> Option<String> {
     }
 
     if let Some(path) = ps1_path {
-        let truncated = if path.len() > 200 { &path[..200] } else { &path };
-        return Some(format!("Script: {}", truncated));
+        return Some(format!("Script: {}", safe_trunc(&path, 200)));
     }
     if best_len >= 20 {
         if let Some(s) = extract_utf16le_str(data, best_start, 200) {
             if s.len() >= 20 {
-                let display = if s.len() > 160 {
-                    format!("{}...", &s[..160])
-                } else {
-                    s
-                };
-                return Some(display);
+                return Some(safe_trunc(&s, 160));
             }
         }
     }
@@ -453,10 +613,19 @@ fn extract_ps_snippet(data: &[u8]) -> Option<String> {
 }
 
 /// Generic snippet extractor for all event IDs without a specific handler.
-/// Returns the longest meaningful UTF-16LE string found in the BinXML payload.
+/// Scans the entire BinXML payload (from record offset 0x18) for meaningful strings.
+/// Priority: path strings (contain '\') → description strings (contain space) → longest.
 fn extract_generic_snippet(data: &[u8]) -> Option<String> {
-    let scan_start = 0xC0usize.min(data.len());
-    let mut best_s: Option<String> = None;
+    // Start right at the BinXML section; the integer/GUID bytes before strings
+    // will simply fail the `hi == 0 && lo >= 0x20` check and be skipped.
+    let scan_start = 0x18usize;
+    if data.len() <= scan_start {
+        return None;
+    }
+
+    let mut path_s: Option<String>  = None; // first string with a backslash (Windows path)
+    let mut desc_s: Option<String>  = None; // first string with a space (descriptive text)
+    let mut best_s: Option<String>  = None; // longest non-noise fallback
     let mut best_len = 0usize;
     let mut i = scan_start;
 
@@ -468,11 +637,20 @@ fn extract_generic_snippet(data: &[u8]) -> Option<String> {
             continue;
         }
         let (len, end) = measure_utf16le_run(data, i);
-        if len >= 6 {
+        if len >= 4 {
             if let Some(s) = extract_utf16le_str(data, i, len.min(240)) {
-                if !is_noise_string(&s) && len > best_len {
-                    best_len = len;
-                    best_s = Some(s);
+                if !is_noise_string(&s) {
+                    if path_s.is_none() && s.contains('\\') {
+                        path_s = Some(s.clone());
+                    }
+                    if desc_s.is_none() && s.contains(' ') && len >= 6 {
+                        desc_s = Some(s.clone());
+                    }
+                    // Require >=8 chars for the generic fallback to avoid trivial words
+                    if len >= 8 && len > best_len {
+                        best_len = len;
+                        best_s = Some(s);
+                    }
                 }
             }
             i = end + 1;
@@ -481,13 +659,8 @@ fn extract_generic_snippet(data: &[u8]) -> Option<String> {
         }
     }
 
-    best_s.map(|s| {
-        if s.len() > 120 {
-            format!("{}...", &s[..120])
-        } else {
-            s
-        }
-    })
+    let result = path_s.or(desc_s).or(best_s)?;
+    Some(safe_trunc(&result, 120))
 }
 
 /// Parse an event record from within a chunk's event records area.
@@ -556,24 +729,14 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
         None
     };
 
-    let base = match (event_name(event_id), channel.is_empty()) {
-        (Some(name), false) => format!("EventID {} - {} [{}]", event_id, name, channel),
-        (Some(name), true)  => format!("EventID {} - {}", event_id, name),
-        (None, false)       => format!("EventID {} [{}]", event_id, channel),
-        (None, true)        => format!("EventID {}", event_id),
-    };
-    let message = if let Some(snippet) = ps_snippet.or(logon_snippet).or(generic_snippet) {
-        format!("{} | {}", base, snippet)
-    } else {
-        base
-    };
+    let snippet = ps_snippet.or(logon_snippet).or(generic_snippet);
 
     Some(EvtxRecord {
         timestamp_ns,
         event_id,
         channel,
         computer,
-        message,
+        snippet,
         level,
     })
 }
@@ -627,28 +790,32 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
         }
 
         if let Some(mut rec) = parse_event_record(&chunk[offset..offset+rec_size]) {
-            // If binary channel scan found nothing, fall back to the log filename
-            if rec.channel.is_empty() {
+            // If binary channel scan found nothing (or returned a URI), fall back to filename
+            if rec.channel.is_empty() || rec.channel.contains("://") {
                 if let Some(fname) = std::path::Path::new(artifact_path)
                     .file_name().and_then(|f| f.to_str())
                 {
                     let stem = fname.trim_end_matches(".evtx").trim_end_matches(".EVTX");
-                    // Decode %4 → / (Windows event log channel separator encoding)
                     rec.channel = stem.replace("%4", "/");
-                    // Rebuild the message with the channel we now have
-                    let base = match event_name(rec.event_id) {
-                        Some(name) => format!("EventID {} - {} [{}]", rec.event_id, name, rec.channel),
-                        None       => format!("EventID {} [{}]", rec.event_id, rec.channel),
-                    };
-                    rec.message = base;
                 }
             }
+            // Build final message once the channel is finalised, preserving any snippet
+            let base = match (event_name(rec.event_id), rec.channel.is_empty()) {
+                (Some(name), false) => format!("EventID {} - {} [{}]", rec.event_id, name, rec.channel),
+                (Some(name), true)  => format!("EventID {} - {}", rec.event_id, name),
+                (None, false)       => format!("EventID {} [{}]", rec.event_id, rec.channel),
+                (None, true)        => format!("EventID {}", rec.event_id),
+            };
+            let message = match &rec.snippet {
+                Some(s) => format!("{} | {}", base, s),
+                None    => base,
+            };
             events.push(TimelineEvent {
                 timestamp_ns: rec.timestamp_ns,
                 macb: "M".to_string(),
                 source: "EVTX".to_string(),
                 artifact: "Windows Event Log".to_string(),
-                message: rec.message,
+                message,
                 hostname: if rec.computer.is_empty() { None } else { Some(rec.computer) },
                 tz_offset_secs: 0,
                 is_fn_timestamp: false,

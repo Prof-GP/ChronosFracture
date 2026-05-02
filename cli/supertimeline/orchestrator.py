@@ -205,16 +205,19 @@ def _dispatch_job(job: ArtifactJob, mft_path_map=None) -> ParseResult:
         log.warning("Parser error [%s] %s — %s", job.artifact_type, job.path, error)
 
     # Inject file_path for parsers that don't set it themselves.
-    # Priority: parser-set value > structured extras > source artifact path.
+    # Priority: parser-set value > structured extras > logical evidence path.
+    # job.logical_path is the path of the source artifact inside the forensic image
+    # (e.g. "Windows\System32\winevt\Logs\Security.evtx"), never the temp location.
+    logical = job.logical_path or job.path
     for ev in events:
         if ev.get("file_path"):
             continue
-        if ev.get("target_path"):       # LNK / JumpList: the file the shortcut points to
+        if ev.get("target_path"):   # LNK / JumpList: the file the shortcut points to
             ev["file_path"] = ev["target_path"]
-        elif ev.get("exe_name"):        # Prefetch: the executable being tracked
+        elif ev.get("exe_name"):    # Prefetch: the executable being tracked
             ev["file_path"] = ev["exe_name"]
         else:
-            ev["file_path"] = job.path  # fallback: path of the artifact file itself
+            ev["file_path"] = logical
 
     return ParseResult(
         artifact_type=job.artifact_type,

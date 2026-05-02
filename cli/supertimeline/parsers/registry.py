@@ -104,12 +104,14 @@ def _read_nk_values(data: bytes, nk_off: int) -> List[Tuple[str, str]]:
     Parse all value (VK) cells for the NK at nk_off.
     Returns a list of (value_name, decoded_value) pairs.
     """
-    if nk_off + 0x28 > len(data):
+    if nk_off + 0x2C > len(data):
         return []
-    values_count = _read_u32(data, nk_off + 0x20)
+    # NK structure (offsets from cell content):
+    #   0x20 unknown, 0x24 number_of_values, 0x28 values_list_offset
+    values_count = _read_u32(data, nk_off + 0x24)
     if values_count == 0 or values_count > 10000:
         return []
-    vl_rel = _read_u32(data, nk_off + 0x24)
+    vl_rel = _read_u32(data, nk_off + 0x28)
     if vl_rel == 0 or vl_rel == 0xFFFF_FFFF:
         return []
 
