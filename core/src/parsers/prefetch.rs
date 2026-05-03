@@ -162,7 +162,7 @@ fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord>
     })
 }
 
-fn events_from_record(rec: PrefetchRecord, path_str: &str) -> Vec<TimelineEvent> {
+fn events_from_record(rec: PrefetchRecord, _path_str: &str) -> Vec<TimelineEvent> {
     rec.last_run_times.iter()
         .filter(|&&ft| ft > 0)
         .map(|&ft| TimelineEvent {
@@ -170,7 +170,6 @@ fn events_from_record(rec: PrefetchRecord, path_str: &str) -> Vec<TimelineEvent>
             macb:            "M".to_string(),
             source:          "PREFETCH".to_string(),
             artifact:        "Prefetch".to_string(),
-            artifact_path:   path_str.to_string(),
             message:         format!("{} - Executed (run count: {})", rec.exe_name, rec.run_count),
             hostname:        None,
             tz_offset_secs:  0,
@@ -237,7 +236,6 @@ pub fn parse_prefetch_bytes_decompressed(
         dict.set_item("macb",            &ev.macb)?;
         dict.set_item("source",          &ev.source)?;
         dict.set_item("artifact",        &ev.artifact)?;
-        dict.set_item("artifact_path",   &ev.artifact_path)?;
         dict.set_item("message",         &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
@@ -282,7 +280,6 @@ pub fn parse_prefetch_dir(py: Python<'_>, dir_path: &str) -> PyResult<Py<PyList>
         dict.set_item("macb", &ev.macb)?;
         dict.set_item("source", &ev.source)?;
         dict.set_item("artifact", &ev.artifact)?;
-        dict.set_item("artifact_path", &ev.artifact_path)?;
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;

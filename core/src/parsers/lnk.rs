@@ -147,7 +147,7 @@ pub(crate) fn parse_lnk_bytes_inner(data: &[u8]) -> Option<LnkParsed> {
     })
 }
 
-pub(crate) fn events_from_lnk(parsed: LnkParsed, lnk_path: &str) -> Vec<TimelineEvent> {
+pub(crate) fn events_from_lnk(parsed: LnkParsed, _lnk_path: &str) -> Vec<TimelineEvent> {
     let (create_ft, access_ft, write_ft) = parsed.target_times;
 
     // Nothing useful if no timestamps and no path
@@ -181,7 +181,6 @@ pub(crate) fn events_from_lnk(parsed: LnkParsed, lnk_path: &str) -> Vec<Timeline
             macb:            macb.to_string(),
             source:          "LNK".to_string(),
             artifact:        "LNK".to_string(),
-            artifact_path:   lnk_path.to_string(),
             message:         format!("{}: {}{}", verb, target, vol_info),
             hostname:        None,
             tz_offset_secs:  0,
@@ -213,7 +212,6 @@ fn event_to_dict<'py>(py: Python<'py>, ev: &TimelineEvent) -> PyResult<Bound<'py
     d.set_item("macb",            &ev.macb)?;
     d.set_item("source",          &ev.source)?;
     d.set_item("artifact",        &ev.artifact)?;
-    d.set_item("artifact_path",   &ev.artifact_path)?;
     d.set_item("message",         &ev.message)?;
     d.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
     d.set_item("tz_offset_secs",  ev.tz_offset_secs)?;

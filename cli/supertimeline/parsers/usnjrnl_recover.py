@@ -113,7 +113,6 @@ def _scan_buffer(data: bytes, artifact_path: str) -> List[Dict[str, Any]]:
             "macb":            "M",
             "source":          "$UsnJrnl:$J",
             "artifact":        "$J (Recovered)",
-            "artifact_path":   artifact_path,
             "message":         f"{kind} {file_name} - {reason_str}",
             "is_fn_timestamp": False,
             "tz_offset_secs":  0,

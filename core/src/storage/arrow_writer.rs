@@ -17,7 +17,6 @@ pub fn schema() -> Arc<Schema> {
         Field::new("macb",             DataType::Utf8,    false),
         Field::new("source",           DataType::Utf8,    false),
         Field::new("artifact",         DataType::Utf8,    false),
-        Field::new("artifact_path",    DataType::Utf8,    false),
         Field::new("message",          DataType::Utf8,    false),
         Field::new("is_fn_timestamp",  DataType::Boolean, false),
         Field::new("tz_offset_secs",   DataType::Int32,   false),
@@ -32,7 +31,6 @@ pub fn write_events_to_parquet(events: &[TimelineEvent], output_path: &str) -> R
     let mut macb_builder          = StringBuilder::new();
     let mut source_builder        = StringBuilder::new();
     let mut artifact_builder      = StringBuilder::new();
-    let mut artifact_path_builder = StringBuilder::new();
     let mut message_builder       = StringBuilder::new();
     let mut is_fn_builder         = BooleanBuilder::new();
     let mut tz_offset_builder     = Int32Builder::new();
@@ -43,7 +41,6 @@ pub fn write_events_to_parquet(events: &[TimelineEvent], output_path: &str) -> R
         macb_builder.append_value(&ev.macb);
         source_builder.append_value(&ev.source);
         artifact_builder.append_value(&ev.artifact);
-        artifact_path_builder.append_value(&ev.artifact_path);
         message_builder.append_value(&ev.message);
         is_fn_builder.append_value(ev.is_fn_timestamp);
         tz_offset_builder.append_value(ev.tz_offset_secs);
@@ -57,7 +54,6 @@ pub fn write_events_to_parquet(events: &[TimelineEvent], output_path: &str) -> R
             Arc::new(macb_builder.finish()),
             Arc::new(source_builder.finish()),
             Arc::new(artifact_builder.finish()),
-            Arc::new(artifact_path_builder.finish()),
             Arc::new(message_builder.finish()),
             Arc::new(is_fn_builder.finish()),
             Arc::new(tz_offset_builder.finish()),

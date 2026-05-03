@@ -34,6 +34,7 @@ fn supertimeline_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EvtxParser>()?;
     m.add_class::<PrefetchParser>()?;
     m.add_function(wrap_pyfunction!(parsers::mft::parse_mft_file, m)?)?;
+    m.add_function(wrap_pyfunction!(parsers::mft::build_mft_path_map, m)?)?;
     m.add_function(wrap_pyfunction!(parsers::usnjrnl::parse_usnjrnl_file, m)?)?;
     m.add_function(wrap_pyfunction!(parsers::evtx::parse_evtx_file, m)?)?;
     m.add_function(wrap_pyfunction!(parsers::prefetch::parse_prefetch_dir, m)?)?;

@@ -14,6 +14,7 @@ the Arsenal Image Mounter / ewfmount commands to pre-mount the image.
 
 from __future__ import annotations
 
+import logging
 import os
 import struct
 import tempfile
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Iterator, Optional, Dict, Tuple
 from dataclasses import dataclass, field
 from enum import Enum, auto
+
+log = logging.getLogger(__name__)
 
 # ── Image format detection ────────────────────────────────────────────────────
 
@@ -172,28 +175,71 @@ def _tsk_extract_file(fs_obj, inode_path: str, dest_path: str,
     """
     Extract a single file from a pytsk3 filesystem object.
 
-    sparse_aware=True skips zero-filled sparse regions — required for
-    $UsnJrnl:$J which is a sparse file whose allocated clusters are at
-    a high logical offset (the tail of the journal).  Without this,
-    read_random() returns zeros for every unallocated byte and the
-    extracted file would be gigabytes of nothing.
+    Handles NTFS Alternate Data Streams via colon notation (e.g.
+    "$Extend/$UsnJrnl:$J") by opening the base file and locating the
+    named $DATA attribute — pytsk3 does not accept colons in path strings,
+    so the Windows "file:stream" notation must be split before the open.
 
-    When sparse_aware is set we read each 1 MiB block and skip it if
-    entirely zero.  This preserves real data while discarding the
-    sparse prefix, producing a compact file that parsers can handle.
+    sparse_aware=True skips zero-filled sparse regions — required for
+    $UsnJrnl:$J which is a sparse circular buffer whose live entries sit
+    at a high logical offset; zero-filled prefix is discarded.
     """
     try:
-        f = fs_obj.open(inode_path)
-        size = f.info.meta.size
+        # Split "base_file:stream_name" for NTFS ADS
+        if ":" in inode_path:
+            open_path, ads_name = inode_path.rsplit(":", 1)
+        else:
+            open_path, ads_name = inode_path, None
+
+        f = fs_obj.open(open_path)
+
+        if ads_name:
+            # Walk the attribute list to find the named $DATA stream.
+            # pytsk3.Attribute has no read_random; reads go via the File
+            # object using f.read_random(off, len, attr_type, attr_id, 1).
+            attr_id = None
+            size    = 0
+            for attr in f:
+                attr_name = attr.info.name
+                if attr_name is None:
+                    continue
+                if isinstance(attr_name, bytes):
+                    attr_name = attr_name.decode("utf-8", errors="replace")
+                if attr_name == ads_name:
+                    attr_id = attr.info.id
+                    try:
+                        size = attr.info.size
+                    except AttributeError:
+                        pass
+                    break
+
+            if attr_id is None:
+                log.debug("_tsk_extract_file: ADS %r not found in %s",
+                          ads_name, open_path)
+                return False
+            if size == 0:
+                size = 4 * 1024 * 1024 * 1024  # 4 GB cap
+
+            _ntfs_data = getattr(pytsk3, "TSK_FS_ATTR_TYPE_NTFS_DATA", 128)
+
+            def _read(off: int, length: int) -> bytes:
+                return f.read_random(off, length, _ntfs_data, attr_id, 1)
+        else:
+            size = f.info.meta.size
+
+            def _read(off: int, length: int) -> bytes:
+                return f.read_random(off, length)
+
         if size == 0:
             return False
+
         chunk = 1024 * 1024
         with open(dest_path, "wb") as out:
             offset = 0
             wrote_any = False
             while offset < size:
                 read_len = min(chunk, size - offset)
-                data = f.read_random(offset, read_len)
+                data = _read(offset, read_len)
                 if not data:
                     break
                 if sparse_aware and not any(data):
@@ -202,15 +248,17 @@ def _tsk_extract_file(fs_obj, inode_path: str, dest_path: str,
                 out.write(data)
                 wrote_any = True
                 offset += len(data)
+
         if sparse_aware and not wrote_any:
-            # All sparse — remove the empty file
             try:
                 os.remove(dest_path)
             except OSError:
                 pass
             return False
         return True
-    except Exception:
+    except Exception as _exc:
+        log.debug("_tsk_extract_file failed for %s: %s: %s",
+                  inode_path, type(_exc).__name__, _exc)
         return False
 
 

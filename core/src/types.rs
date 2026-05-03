@@ -25,8 +25,6 @@ pub struct TimelineEvent {
     pub source: String,
     /// Artifact type (e.g. "$MFT", "EVTX", "PREFETCH")
     pub artifact: String,
-    /// Full file path or key path of the artifact
-    pub artifact_path: String,
     /// Human-readable description of the event
     pub message: String,
     /// Hostname extracted from the source (if available)

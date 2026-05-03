@@ -30,6 +30,12 @@ const TOKEN_NORMAL_SUB:   u8 = 0x0D;
 const TOKEN_OPT_SUB:      u8 = 0x0E;
 const TOKEN_END_OF_STREAM: u8 = 0x0F;
 
+// BinXML substitution value types (used in template-instance descriptor table)
+const BX_STRING:  u8 = 0x01; // UTF-16LE string; size = byte count (no null terminator)
+const BX_INT32:   u8 = 0x07; // 4-byte signed int
+const BX_UINT32:  u8 = 0x08; // 4-byte unsigned int (e.g. LogonType)
+const BX_HEX32:   u8 = 0x14; // 4-byte int displayed as hex (HexInt32)
+
 
 /// Minimal EVTX event record extracted from a chunk
 #[derive(Debug, Clone)]
@@ -38,7 +44,7 @@ struct EvtxRecord {
     event_id: u32,
     channel: String,
     computer: String,
-    message: String,
+    snippet: Option<String>,  // extra context appended after base message
     level: u8,
 }
 
@@ -243,17 +249,93 @@ fn extract_utf16le_str(data: &[u8], start: usize, max_chars: usize) -> Option<St
     }
 }
 
+/// Safely truncate a string to at most `max_chars` Unicode characters.
+/// Uses char boundaries — never panics on multi-byte sequences.
+fn safe_trunc(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        None    => s.to_string(),
+        Some((i, _)) => format!("{}...", &s[..i]),
+    }
+}
+
 /// Return true if a string should be skipped when looking for meaningful content.
 fn is_noise_string(s: &str) -> bool {
     // GUIDs: 36 chars, 4 hyphens
     if s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4 {
         return true;
     }
+    // XML namespace URIs and any URL — includes partial reads like "5http://..."
+    if s.contains("://") {
+        return true;
+    }
     // Provider / channel names
     if s.starts_with("Microsoft-Windows-") || s.starts_with("Microsoft-")
         || s.starts_with("PowerShell") || s.starts_with("Windows PowerShell")
-        || s.starts_with("http://") || s.starts_with("https://")
     {
+        return true;
+    }
+    // Single-word Windows event log channel names + common Windows non-username strings
+    if matches!(s, "Security" | "System" | "Application" | "Setup" | "ForwardedEvents"
+        | "Windows" | "System32" | "SysWOW64" | "Microsoft"
+        | "soft" | "osoft" | "rosoft" | "Type" | "Cryp" | "Crypt")
+    {
+        return true;
+    }
+    // Channel-name and provider-name fragments from odd-alignment reads.
+    // These appear when the BinXML template is stored inline in the record and the scanner
+    // reads into the provider name "Microsoft-Windows-Security-Auditing" at a non-zero offset.
+    if s.contains("-Security-Auditing") || s.contains("Security-Auditing")
+        || s.contains("-Windows-Security") || s.contains("icrosoft-")
+        || s.contains("-Windows-") || s.contains("AUTHORITY")
+    {
+        return true;
+    }
+    // BinXML element/attribute names that appear in inline template definitions.
+    // These are field name labels, not data values, so they must never become snippets.
+    static FIELD_NAMES: &[&str] = &[
+        "Provider", "EventID", "Version", "Level", "Task", "Opcode",
+        "Keywords", "TimeCreated", "SystemTime", "EventRecordID",
+        "Correlation", "ActivityID", "RelatedActivityID",
+        "Execution", "ProcessID", "ThreadID", "Channel", "Computer",
+        "EventData", "BinaryData", "UserData", "RenderingInfo",
+        "SubjectUserSid", "SubjectUserName", "SubjectDomainName", "SubjectLogonId",
+        "TargetUserSid", "TargetUserName", "TargetDomainName", "TargetLogonId",
+        "TargetOutboundUserName", "TargetOutboundDomainName",
+        "LogonType", "LogonProcessName", "AuthenticationPackageName", "LogonGuid",
+        "WorkstationName", "IpAddress", "IpPort", "TransmittedServices",
+        "LmPackageName", "KeyLength", "ImpersonationLevel", "VirtualAccount",
+        "LinkedLogonId", "ElevatedToken", "TokenElevationType", "MandatoryLabel",
+        "CallerProcessId", "CallerProcessName", "ProcessName", "ProcessPath",
+        "ObjectServer", "ObjectType", "ObjectName", "HandleId", "ResourceAttributes",
+        "ServiceName", "ServiceFileName", "ServiceType", "ServiceStartType",
+        "ServiceAccount", "TaskName", "TaskContent", "TaskContentNew",
+        "AccountName", "AccountDomain", "OldAccountName", "NewAccountName",
+        "GroupName", "GroupSid", "GroupType", "SidHistory",
+        "UserSid", "UserName", "DomainName", "Qualifiers",
+        "PackageName", "TokenType", "PrivilegeList", "ShareName", "ShareLocalPath",
+        "Application", "Direction", "SourceAddress", "SourcePort",
+        "DestAddress", "DestPort", "Protocol",
+        "QueryName", "QueryType", "QueryResults", "QueryStatus",
+        "ScriptBlockText", "ScriptBlockId", "MessageNumber", "MessageTotal",
+        "Path", "Param1", "Param2", "Param3", "Param4", "Param5",
+        "Param6", "Param7", "Param8",
+        "Name", "Guid", "Value",
+        "TargetLogonGuid", "LogonGuid", "SubjectLogonGuid",
+        "DeviceVersionMajor", "DeviceVersionMinor",
+        "OperationTime", "OperationTime_msecs",
+        "ErrorCode", "ResultCode", "StatusCode",
+        "hc_stateid", "TaskId", "TaskContent", "TaskName",
+        "TargetVolumeGuid", "VolumeGuid",
+        "RuleId", "RuleName", "FilterId",
+        "TargetServerName", "TargetInfo", "TargetDomainSid",
+        "TargetLinkedLogonId", "TargetLogonId", "SubjectLinkedLogonId",
+        "FailureReason", "SubStatus", "FailedApplication",
+        "RestrictedAdminMode", "RemoteCredentialGuard",
+        "ElevatedToken", "VirtualAccount", "AuditPolicyChanges",
+        "CategoryId", "SubcategoryId", "SubcategoryGuid",
+        "PrivilegeList",
+    ];
+    if FIELD_NAMES.contains(&s) {
         return true;
     }
     false
@@ -279,7 +361,6 @@ fn measure_utf16le_run(data: &[u8], start: usize) -> (usize, usize) {
 /// Steps byte-by-byte so odd-aligned strings (common in EVTX BinXML) are found.
 fn scan_for_channel(data: &[u8]) -> String {
     let scan_end = data.len().min(0x18 + 600);
-    let mut best: Option<String> = None;
     let mut i = 0x18;
     while i + 1 < scan_end {
         let lo = data[i];
@@ -292,23 +373,28 @@ fn scan_for_channel(data: &[u8]) -> String {
         let (len, end) = measure_utf16le_run(data, i);
         if len >= 4 {
             if let Some(s) = extract_utf16le_str(data, i, 100) {
-                if s.starts_with("Security") || s.starts_with("System")
-                    || s.starts_with("Application") || s.starts_with("Microsoft-")
-                    || s.starts_with("Windows ") || s.starts_with("PowerShell")
-                    || s.contains('/') || s.contains('%')
-                {
-                    return s;
-                }
-                if best.is_none() || s.len() > best.as_ref().map_or(0, |b| b.len()) {
-                    best = Some(s);
+                // Skip XML namespace URIs — they appear in every EVTX record and are not channel names
+                // Only accept strings that look like Windows channel names.
+                // The "best fallback" was previously returning event-data strings
+                // (e.g. "Compositor Type: 1", "Id=..., DisplayName=...") as the
+                // channel when no known prefix matched.  Those cases now return ""
+                // so the filename-based fallback in parse_evtx_chunk takes over.
+                if !s.contains("://") && !s.contains('=') && !s.contains(':') {
+                    if s.starts_with("Security") || s.starts_with("System")
+                        || s.starts_with("Application") || s.starts_with("Microsoft-")
+                        || s.starts_with("Windows ") || s.starts_with("PowerShell")
+                        || (s.contains('/') && !s.contains("://")) || s.contains('%')
+                    {
+                        return s;
+                    }
                 }
             }
-            i = end + 1; // step past this string (+ 1 for null terminator lo byte)
+            i = end + 1;
         } else {
             i += 1;
         }
     }
-    best.unwrap_or_default()
+    String::new() // empty → caller falls back to filename
 }
 
 fn logon_type_name(t: u32) -> &'static str {
@@ -326,22 +412,227 @@ fn logon_type_name(t: u32) -> &'static str {
     }
 }
 
+// ── BinXML substitution-table helpers ────────────────────────────────────────
+//
+// Standard EVTX event records begin at record offset 0x18 with a BinXML
+// TOKEN_TEMPLATE_INST (0x0C).  The layout is:
+//
+//   [0]        1 byte  token (0x0C; OR 0x4C if has-more bit set)
+//   [1..5]     4 bytes template definition offset (ignored)
+//   [5..21]   16 bytes template GUID (ignored)
+//   [21..25]   4 bytes substitution count N
+//   [25..]     N × 3-byte descriptors: [u16 size][u8 type]
+//   [25+N×3..] packed substitution value data
+//
+// For standard Windows events N=23, so value data starts at xml_data[0x5E]
+// which matches the empirically validated EventID probe elsewhere in this file.
+
+/// Parse the template-instance substitution table from the start of `xml_data`
+/// (i.e. from record offset 0x18 onward).
+/// Returns (val_data_start, types, sizes) on success, or None if the record
+/// does not begin with a recognisable template instance.
+fn parse_subst_table(xml_data: &[u8]) -> Option<(usize, Vec<u8>, Vec<usize>)> {
+    if xml_data.len() < 26 { return None; }
+
+    // Accept 0x0C (standard) and 0x4C (has-more bit set)
+    if xml_data[0] & 0x0F != TOKEN_TEMPLATE_INST { return None; }
+
+    let n = r_u32(xml_data, 21) as usize;
+    if n == 0 || n > 256 { return None; }
+
+    let desc_start = 25usize;
+    let val_start  = desc_start.saturating_add(n * 3);
+    if val_start > xml_data.len() { return None; }
+
+    let mut types  = Vec::with_capacity(n);
+    let mut sizes  = Vec::with_capacity(n);
+    let mut total  = 0usize;
+
+    for i in 0..n {
+        let base = desc_start + i * 3;
+        if base + 3 > xml_data.len() { return None; }
+        let sz  = r_u16(xml_data, base) as usize;
+        let typ = xml_data[base + 2];
+        sizes.push(sz);
+        types.push(typ);
+        total = total.saturating_add(sz);
+    }
+
+    if val_start.saturating_add(total) > xml_data.len() { return None; }
+
+    Some((val_start, types, sizes))
+}
+
+/// Decode every BX_STRING substitution value into a Vec<String>.
+/// Only the packed substitution value data is accessed — the template
+/// definition text (where provider-name fragments live) is never touched.
+fn subst_all_strings(
+    xml_data:  &[u8],
+    val_start: usize,
+    types:     &[u8],
+    sizes:     &[usize],
+) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut off2 = 0usize;
+    for (&typ, &sz) in types.iter().zip(sizes.iter()) {
+        if typ == BX_STRING && sz >= 2 && sz % 2 == 0 {
+            let abs = val_start + off2;
+            if abs + sz <= xml_data.len() {
+                let raw  = &xml_data[abs..abs + sz];
+                let u16s: Vec<u16> = raw.chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                let s = String::from_utf16_lossy(&u16s);
+                let s = s.trim_end_matches('\0');
+                if !s.is_empty() {
+                    result.push(s.to_string());
+                }
+            }
+        }
+        off2 += sz;
+    }
+    result
+}
+
+/// Search substitution values for the first UInt32 / Int32 / HexInt32 whose
+/// decoded value falls in [lo, hi].  Used to locate LogonType (range 2..=11).
+fn subst_find_u32_in_range(
+    xml_data:  &[u8],
+    val_start: usize,
+    types:     &[u8],
+    sizes:     &[usize],
+    lo: u32,
+    hi: u32,
+) -> Option<u32> {
+    let mut off = 0usize;
+    for (&typ, &sz) in types.iter().zip(sizes.iter()) {
+        if matches!(typ, BX_UINT32 | BX_INT32 | BX_HEX32) && sz >= 4 {
+            let abs = val_start + off;
+            if abs + 4 <= xml_data.len() {
+                let v = r_u32(xml_data, abs);
+                if v >= lo && v <= hi { return Some(v); }
+            }
+        }
+        off += sz;
+    }
+    None
+}
+
 /// For logon/logoff events, extract the account name and logon type.
-/// BinXML value table layout for Security 4624:
-///   SubjectUserSid, SubjectUserName, SubjectDomainName, SubjectLogonId,
-///   TargetUserSid,  TargetUserName,  TargetDomainName,  TargetLogonId, LogonType, ...
-/// We skip SYSTEM/NT AUTHORITY so the first remaining UTF-16LE string is TargetUserName.
-fn extract_logon_snippet(data: &[u8]) -> Option<String> {
-    // Skip EVTX record header (0x18) + BinXML system values (~0xA8) + channel/computer strings
+/// `with_logon_type`: only true for events that actually carry a LogonType
+/// field (4624, 4625, 4648).  Other logon-family events (4634, 4647, 4672,
+/// 4776) have account names but no LogonType — passing false avoids spurious
+/// type numbers from unrelated uint32 fields in the same record.
+/// Primary path: parse the BinXML substitution table so only actual field
+/// values are examined — no template text fragments can bleed through.
+/// Fallback: byte scan for records that embed the template definition inline
+/// (first-occurrence records in each chunk).
+fn extract_logon_snippet(data: &[u8], with_logon_type: bool) -> Option<String> {
+    if data.len() <= 0x18 { return None; }
+    let xml_data = &data[0x18..];
+
+    // ── Structured path ────────────────────────────────────────────────────
+    if let Some((val_start, types, sizes)) = parse_subst_table(xml_data) {
+        let all_strs   = subst_all_strings(xml_data, val_start, &types, &sizes);
+        let logon_type = if with_logon_type {
+            subst_find_u32_in_range(xml_data, val_start, &types, &sizes, 2, 11)
+        } else {
+            None
+        };
+
+        // Strings that are fields in the event record but are not account names.
+        // This list is intentionally short because the substitution table only
+        // contains actual field values — provider name fragments are never present.
+        static SKIP: &[&str] = &[
+            "SYSTEM", "-", "NT AUTHORITY", "ANONYMOUS LOGON",
+            "LOCAL SERVICE", "NETWORK SERVICE", "Window Manager", "Font Driver Host",
+            "WORKGROUP", "NULL SID", "Everyone",
+            "DWM-1","DWM-2","DWM-3","DWM-4","DWM-5",
+            "UMFD-0","UMFD-1","UMFD-2","UMFD-3","UMFD-4",
+            // LogonProcessName / authentication package / negotiation strings
+            "Advapi","User32","Schannel","NtLmSsp",
+            "MICROSOFT_AUTHENTICATION_PACKAGE_V1_0",
+            "Kerberos","Negotiate","NTLM",
+            "RestrictedAdminMode","RemoteCredentialGuard",
+            // Channel and computer field values appear before EventData in substitution order
+            "Security","System","Application","localhost","::1",
+            // ElevatedToken expansion codes
+            "%%1842","%%1843","%%1844",
+        ];
+
+        let is_ip = |s: &str| -> bool {
+            s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                && s.chars().filter(|c| *c == '.').count() >= 2
+        };
+
+        let candidates: Vec<String> = all_strs.into_iter()
+            .filter(|s| {
+                !SKIP.iter().any(|n| s.eq_ignore_ascii_case(n))
+                && !s.starts_with("S-1-")
+                && !s.starts_with("%%")
+                && !s.starts_with("Microsoft")
+                && !s.contains("Auditing")
+                && !s.contains("://")
+                && !s.contains('\\')
+                && s.trim() == s.as_str()
+                && !s.chars().all(|c| c.is_ascii_digit())
+                && !is_ip(s)
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return logon_type.map(|t| format!("Type {} ({})", t, logon_type_name(t)));
+        }
+
+        let account  = &candidates[0];
+        let target   = candidates.get(1).filter(|t| **t != *account).cloned();
+        let acct_part = match &target {
+            Some(t) => format!("Account: {} | Target: {}", account, t),
+            None    => format!("Account: {}", account),
+        };
+        return Some(match logon_type {
+            Some(t) => format!("Type {} ({}) | {}", t, logon_type_name(t), acct_part),
+            None    => acct_part,
+        });
+    }
+
+    // ── Fallback: byte scan ────────────────────────────────────────────────
+    extract_logon_snippet_scan(data, with_logon_type)
+}
+
+/// Byte-scan fallback for extract_logon_snippet.
+fn extract_logon_snippet_scan(data: &[u8], with_logon_type: bool) -> Option<String> {
     let scan_start = 0xC0usize.min(data.len());
 
     static SKIP_ACCTS: &[&str] = &[
         "SYSTEM", "-", "NT AUTHORITY", "ANONYMOUS LOGON",
-        "LOCAL SERVICE", "NETWORK SERVICE", "Window Manager", "DWM-1",
+        "LOCAL SERVICE", "NETWORK SERVICE", "Window Manager",
+        "WORKGROUP", "NULL SID", "Everyone",
+        "DWM-1","DWM-2","DWM-3","DWM-4","DWM-5",
+        "UMFD-0","UMFD-1","UMFD-2","UMFD-3","UMFD-4",
+        "Advapi","User32","Schannel","NtLmSsp",
+        "MICROSOFT_AUTHENTICATION_PACKAGE_V1_0",
+        "Status","ProcessId","SubStatus",
+        "Negotiate","Kerberos","NTLM",
+        "RestrictedAdminMode","RemoteCredentialGuard",
+        "localhost","Font Driver Host",
+        "Microsoft","icrosoft",
+        "Windows","System32","SysWOW64","System",
+        "soft","osoft","rosoft","Type","Cryp","Crypt","Info",
+        "KTOP","SKTO","ESKTO","DESKTO",
+        "ORKG","WORK","ROUP","GROU","Wind",
+        "AUTH","UTHO","THOR","HORI","ORIT","RITY",
+        "SECU","ECUR","CURI","URIT",
+        "Priv","PRIV","Buil","Envi","ECDS","ECDC",
+        "Read","Targ","Retu","Exec",
     ];
 
-    // Collect UTF-16LE string candidates with their end-byte position
-    let mut candidates: Vec<(String, usize)> = Vec::new();
+    let is_privilege = |s: &str| -> bool {
+        (s.starts_with("Se") && s.len() > 8 && s.chars().all(|c| c.is_ascii_alphanumeric()))
+            || s.ends_with("Privilege")
+    };
+
+    let mut candidates: Vec<String> = Vec::new();
     let mut i = scan_start;
     while i + 1 < data.len() {
         let lo = data[i];
@@ -351,18 +642,29 @@ fn extract_logon_snippet(data: &[u8]) -> Option<String> {
             continue;
         }
         let (len, end) = measure_utf16le_run(data, i);
-        if (2..=48).contains(&len) {
+        if (4..=48).contains(&len) {
             if let Some(s) = extract_utf16le_str(data, i, len) {
+                let starts_lower    = s.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false);
+                let short_hyphen    = len <= 5 && s.contains('-');
+                let short_space     = len <= 5 && s.contains(' ');
+                let starts_dot      = s.starts_with('.') || (len <= 4 && s.contains('.'));
+                let short_mixed     = len <= 4
+                    && s.chars().any(|c| c.is_ascii_digit())
+                    && s.chars().any(|c| c.is_ascii_alphabetic());
+                let is_ip           = s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    && s.chars().filter(|c| *c == '.').count() >= 2;
                 let skip = SKIP_ACCTS.iter().any(|n| s.eq_ignore_ascii_case(n))
                     || s.starts_with("S-1-")
                     || is_noise_string(&s)
-                    || s.contains('\\')
-                    || s.contains('/')
+                    || is_privilege(&s)
+                    || starts_lower || short_hyphen || short_space
+                    || starts_dot || short_mixed || is_ip
+                    || s.contains('\\') || s.contains('/')
                     || s.ends_with('$')
+                    || s.trim() != s
+                    || s.chars().all(|c| c.is_ascii_digit())
                     || s.chars().any(|c| !c.is_ascii_alphanumeric() && !"._- @".contains(c));
-                if !skip {
-                    candidates.push((s, end));
-                }
+                if !skip { candidates.push(s); }
                 i = end;
                 continue;
             }
@@ -370,27 +672,30 @@ fn extract_logon_snippet(data: &[u8]) -> Option<String> {
         i += 1;
     }
 
-    // First candidate = TargetUserName (Subject names filtered as SYSTEM/NT AUTHORITY)
-    let (username, name_end) = candidates.into_iter().next()?;
-
-    // Scan for logon type: uint32 little-endian with value [2,11] and upper 2 bytes == 0
-    // Start just after where we found the username
     let mut logon_type: Option<u32> = None;
-    let type_scan = name_end.min(data.len());
-    let mut j = type_scan;
-    while j + 4 <= data.len() {
-        let lo = u16::from_le_bytes([data[j], data[j + 1]]) as u32;
-        let hi = u16::from_le_bytes([data[j + 2], data[j + 3]]) as u32;
-        if (2..=11).contains(&lo) && hi == 0 {
-            logon_type = Some(lo);
-            break;
+    if with_logon_type {
+        let mut j = scan_start;
+        while j + 4 <= data.len() {
+            let lo = u16::from_le_bytes([data[j], data[j + 1]]) as u32;
+            let hi = u16::from_le_bytes([data[j + 2], data[j + 3]]) as u32;
+            if (2..=11).contains(&lo) && hi == 0 { logon_type = Some(lo); break; }
+            j += 1;
         }
-        j += 1;
     }
 
+    if candidates.is_empty() {
+        return logon_type.map(|t| format!("Type {} ({})", t, logon_type_name(t)));
+    }
+
+    let account  = candidates[0].clone();
+    let target   = candidates.get(1).filter(|t| t.as_str() != account.as_str()).cloned();
+    let acct_part = match target {
+        Some(t) => format!("Account: {} | Target: {}", account, t),
+        None    => format!("Account: {}", account),
+    };
     Some(match logon_type {
-        Some(t) => format!("Type {} ({}) | Account: {}", t, logon_type_name(t), username),
-        None    => format!("Account: {}", username),
+        Some(t) => format!("Type {} ({}) | {}", t, logon_type_name(t), acct_part),
+        None    => acct_part,
     })
 }
 
@@ -430,22 +735,70 @@ fn extract_ps_snippet(data: &[u8]) -> Option<String> {
     }
 
     if let Some(path) = ps1_path {
-        let truncated = if path.len() > 200 { &path[..200] } else { &path };
-        return Some(format!("Script: {}", truncated));
+        return Some(format!("Script: {}", safe_trunc(&path, 200)));
     }
     if best_len >= 20 {
         if let Some(s) = extract_utf16le_str(data, best_start, 200) {
             if s.len() >= 20 {
-                let display = if s.len() > 160 {
-                    format!("{}...", &s[..160])
-                } else {
-                    s
-                };
-                return Some(display);
+                return Some(safe_trunc(&s, 160));
             }
         }
     }
     None
+}
+
+/// Generic snippet extractor for all event IDs without a specific handler.
+/// Scans the entire BinXML payload (from record offset 0x18) for meaningful strings.
+/// Priority: path strings (contain '\') → description strings (contain space) → longest.
+fn extract_generic_snippet(data: &[u8]) -> Option<String> {
+    if data.len() <= 0x18 { return None; }
+    let xml_data = &data[0x18..];
+
+    // ── Structured path: only look at actual substitution values ──────────
+    if let Some((val_start, types, sizes)) = parse_subst_table(xml_data) {
+        let all_strs = subst_all_strings(xml_data, val_start, &types, &sizes);
+        let mut path_s: Option<String> = None;
+        let mut desc_s: Option<String> = None;
+        let mut best_s: Option<String> = None;
+        let mut best_len = 0usize;
+        for s in all_strs {
+            if is_noise_string(&s) { continue; }
+            if path_s.is_none() && s.contains('\\') { path_s = Some(s.clone()); }
+            if desc_s.is_none() && s.contains(' ') && s.len() >= 6 { desc_s = Some(s.clone()); }
+            if s.len() >= 8 && s.len() > best_len { best_len = s.len(); best_s = Some(s); }
+        }
+        if let Some(result) = path_s.or(desc_s).or(best_s) {
+            return Some(safe_trunc(&result, 120));
+        }
+    }
+
+    // ── Fallback: byte scan ───────────────────────────────────────────────
+    let scan_start = 0x18usize;
+    let mut path_s: Option<String> = None;
+    let mut desc_s: Option<String> = None;
+    let mut best_s: Option<String> = None;
+    let mut best_len = 0usize;
+    let mut i = scan_start;
+    while i + 1 < data.len() {
+        let lo = data[i];
+        let hi = data[i + 1];
+        if hi != 0 || lo < 0x20 { i += 1; continue; }
+        let (len, end) = measure_utf16le_run(data, i);
+        if len >= 4 {
+            if let Some(s) = extract_utf16le_str(data, i, len.min(240)) {
+                if !is_noise_string(&s) {
+                    if path_s.is_none() && s.contains('\\') { path_s = Some(s.clone()); }
+                    if desc_s.is_none() && s.contains(' ') && len >= 6 { desc_s = Some(s.clone()); }
+                    if len >= 8 && len > best_len { best_len = len; best_s = Some(s); }
+                }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    let result = path_s.or(desc_s).or(best_s)?;
+    Some(safe_trunc(&result, 120))
 }
 
 /// Parse an event record from within a chunk's event records area.
@@ -494,37 +847,24 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
 
     let channel = scan_for_channel(data);
 
-    // For PowerShell script block events, extract a snippet of the command
-    let ps_snippet = if event_id == 4103 || event_id == 4104 {
-        extract_ps_snippet(data)
-    } else {
-        None
-    };
-
-    // For logon/logoff events, extract account name and logon type
-    let logon_snippet = match event_id {
-        4624 | 4625 | 4634 | 4647 | 4648 | 4672 | 4776 => extract_logon_snippet(data),
+    // Extract a contextual snippet for every event.
+    // Priority: event-specific handler → generic substitution-table extractor.
+    let specific_snippet = match event_id {
+        4103 | 4104 => extract_ps_snippet(data),
+        // with_logon_type=true only for events that actually carry a LogonType field
+        4624 | 4625 | 4648 => extract_logon_snippet(data, true),
+        // account-name only — no LogonType field in these events
+        4634 | 4647 | 4672 | 4776 => extract_logon_snippet(data, false),
         _ => None,
     };
-
-    let base = match (event_name(event_id), channel.is_empty()) {
-        (Some(name), false) => format!("EventID {} - {} [{}]", event_id, name, channel),
-        (Some(name), true)  => format!("EventID {} - {}", event_id, name),
-        (None, false)       => format!("EventID {} [{}]", event_id, channel),
-        (None, true)        => format!("EventID {}", event_id),
-    };
-    let message = if let Some(snippet) = ps_snippet.or(logon_snippet) {
-        format!("{} | {}", base, snippet)
-    } else {
-        base
-    };
+    let snippet = specific_snippet.or_else(|| extract_generic_snippet(data));
 
     Some(EvtxRecord {
         timestamp_ns,
         event_id,
         channel,
         computer,
-        message,
+        snippet,
         level,
     })
 }
@@ -578,29 +918,32 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
         }
 
         if let Some(mut rec) = parse_event_record(&chunk[offset..offset+rec_size]) {
-            // If binary channel scan found nothing, fall back to the log filename
-            if rec.channel.is_empty() {
+            // If binary channel scan found nothing (or returned a URI), fall back to filename
+            if rec.channel.is_empty() || rec.channel.contains("://") {
                 if let Some(fname) = std::path::Path::new(artifact_path)
                     .file_name().and_then(|f| f.to_str())
                 {
                     let stem = fname.trim_end_matches(".evtx").trim_end_matches(".EVTX");
-                    // Decode %4 → / (Windows event log channel separator encoding)
                     rec.channel = stem.replace("%4", "/");
-                    // Rebuild the message with the channel we now have
-                    let base = match event_name(rec.event_id) {
-                        Some(name) => format!("EventID {} - {} [{}]", rec.event_id, name, rec.channel),
-                        None       => format!("EventID {} [{}]", rec.event_id, rec.channel),
-                    };
-                    rec.message = base;
                 }
             }
+            // Build final message once the channel is finalised, preserving any snippet
+            let base = match (event_name(rec.event_id), rec.channel.is_empty()) {
+                (Some(name), false) => format!("EventID {} - {} [{}]", rec.event_id, name, rec.channel),
+                (Some(name), true)  => format!("EventID {} - {}", rec.event_id, name),
+                (None, false)       => format!("EventID {} [{}]", rec.event_id, rec.channel),
+                (None, true)        => format!("EventID {}", rec.event_id),
+            };
+            let message = match &rec.snippet {
+                Some(s) => format!("{} - {}", base, s),
+                None    => base,
+            };
             events.push(TimelineEvent {
                 timestamp_ns: rec.timestamp_ns,
                 macb: "M".to_string(),
                 source: "EVTX".to_string(),
                 artifact: "Windows Event Log".to_string(),
-                artifact_path: artifact_path.to_string(),
-                message: rec.message,
+                message,
                 hostname: if rec.computer.is_empty() { None } else { Some(rec.computer) },
                 tz_offset_secs: 0,
                 is_fn_timestamp: false,
@@ -654,7 +997,6 @@ pub fn parse_evtx_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
         dict.set_item("macb", &ev.macb)?;
         dict.set_item("source", &ev.source)?;
         dict.set_item("artifact", &ev.artifact)?;
-        dict.set_item("artifact_path", &ev.artifact_path)?;
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;
