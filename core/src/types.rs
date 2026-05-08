@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventExtra {
     Mft      { mft_entry: u64 },
-    Evtx     { event_id: u32, channel: String, level: u8 },
+    Evtx     { event_id: u32, record_number: u64, channel: String, level: u8 },
     Prefetch { exe_name: String, exe_path: String, run_count: u32, prefetch_hash: String, version: u32 },
     Lnk      { target_path: String, drive_type: u32, drive_serial: String, volume_label: String },
     Usn      { reasons: String, file_attributes: u32 },

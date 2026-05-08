@@ -78,16 +78,26 @@ pub(crate) fn parse_lnk_bytes_inner(data: &[u8]) -> Option<LnkParsed> {
 
         if li_size >= 28 && li_start + li_size <= data.len() {
             // Prefer Unicode local base path (LinkInfoHeader >= 0x24)
+            // Full path = LocalBasePathOffsetUnicode (0x1C) + CommonPathSuffixOffsetUnicode (0x20)
             if li_hdr_sz >= 0x24 {
-                let ub_off = r_u32(data, li_start + 0x20) as usize;
-                if ub_off > 0 {
-                    let p = r_utf16_null(data, li_start + ub_off);
-                    if !p.is_empty() { target_path = p; }
+                let lb_ub_off = r_u32(data, li_start + 0x1C) as usize;
+                let cs_ub_off = r_u32(data, li_start + 0x20) as usize;
+                if lb_ub_off > 0 {
+                    let base = r_utf16_null(data, li_start + lb_ub_off);
+                    if !base.is_empty() {
+                        let suffix = if cs_ub_off > 0 { r_utf16_null(data, li_start + cs_ub_off) } else { String::new() };
+                        target_path = format!("{}{}", base, suffix);
+                    }
                 }
             }
-            // ASCII fallback
+            // ASCII fallback: LocalBasePathOffset (0x10) + CommonPathSuffixOffset (0x18)
             if target_path.is_empty() && base_off > 0 {
-                target_path = r_ascii_null(data, li_start + base_off);
+                let base = r_ascii_null(data, li_start + base_off);
+                if !base.is_empty() {
+                    let cs_off = r_u32(data, li_start + 0x18) as usize;
+                    let suffix = if cs_off > 0 { r_ascii_null(data, li_start + cs_off) } else { String::new() };
+                    target_path = format!("{}{}", base, suffix);
+                }
             }
 
             // VolumeID block (LinkInfoFlags bit 0 = VolumeIDAndLocalBasePath)

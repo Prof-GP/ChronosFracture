@@ -6,7 +6,7 @@ use pyo3::types::{PyList, PyDict};
 
 use crate::types::{TimelineEvent, EventExtra};
 use super::lnk::{parse_lnk_bytes_inner, events_from_lnk};
-use super::read_helpers::{r_u16, r_u32, r_u64, r_utf16_counted};
+use super::read_helpers::{r_u16, r_u32, r_u64, r_utf16_counted, r_utf16_null};
 
 // ── CFB (OLE Compound File Binary) constants ──────────────────────────────────
 
@@ -204,10 +204,10 @@ impl<'a> Cfb<'a> {
 ///
 /// DestList contains per-entry last-access timestamps and target paths.
 /// Entry layout by version (empirically validated on Windows 10/11):
-///   v3 (Win7/8):  FILETIME at 0x20, path_len(u16) at 0x30, path at 0x32
-///   v4 (Win10+):  FILETIME at 0x64, path_len(u16) at 0x82, path at 0x84
+///   v3 (Win7/8):  FILETIME at 0x20, path (null-terminated UTF-16LE) at 0x30
+///   v4 (Win10+):  FILETIME at 0x64, path (null-terminated UTF-16LE) at 0x82
 ///
-/// Entry advancement: fixed_path_offset + 2 (path_len u16) + path_len * 2 + 2 (null)
+/// Entry advancement: path_off + (path_len + 1) * 2
 fn parse_destlist(data: &[u8], _artifact_path: &str) -> Vec<TimelineEvent> {
     if data.len() < 32 { return Vec::new(); }
 
@@ -215,16 +215,14 @@ fn parse_destlist(data: &[u8], _artifact_path: &str) -> Vec<TimelineEvent> {
     let num_entries = r_u32(data, 4) as usize;
     if num_entries == 0 || num_entries > 5000 { return Vec::new(); }
 
-    // (filetime_off, path_len_off, path_off) relative to entry start
-    let layout = match version {
-        3 => (0x20usize, 0x30usize, 0x32usize),
-        4 => (0x64usize, 0x82usize, 0x84usize),
-        // Unknown version: scan for FILETIME in first 200 bytes then adjacent path
+    // (filetime_off, path_off) relative to entry start; path is null-terminated UTF-16LE
+    let (ft_off, path_off) = match version {
+        3 => (0x20usize, 0x30usize),
+        4 => (0x64usize, 0x82usize),
         _ => {
             return parse_destlist_scan(data, _artifact_path, num_entries);
         }
     };
-    let (ft_off, pl_off, path_off) = layout;
 
     let mut events = Vec::new();
     let mut pos = 32usize; // skip DestList header
@@ -232,16 +230,13 @@ fn parse_destlist(data: &[u8], _artifact_path: &str) -> Vec<TimelineEvent> {
     for _ in 0..num_entries {
         if pos + path_off + 2 > data.len() { break; }
 
-        let ft       = r_u64(data, pos + ft_off);
-        let path_len = r_u16(data, pos + pl_off) as usize;
-
-        if path_len == 0 || path_len > 512 { break; }
-        if pos + path_off + path_len * 2 > data.len() { break; }
-
-        let target = r_utf16_counted(data, pos + path_off, path_len);
+        let ft     = r_u64(data, pos + ft_off);
+        let target = r_utf16_null(data, pos + path_off);
         let ns     = crate::types::filetime_to_unix_ns(ft);
 
-        if ns > 0 && !target.is_empty() {
+        if target.is_empty() { break; }
+
+        if ns > 0 {
             events.push(TimelineEvent {
                 timestamp_ns:    ns,
                 macb:            "A".to_string(),
@@ -259,8 +254,8 @@ fn parse_destlist(data: &[u8], _artifact_path: &str) -> Vec<TimelineEvent> {
             });
         }
 
-        // Advance: path_off includes the path_len uint16, then path_len chars + null
-        pos += path_off + 2 + path_len * 2;
+        // Advance past this entry: path_off + null-terminated UTF-16LE (len + 1 code units)
+        pos += path_off + (target.len() + 1) * 2;
     }
     events
 }
@@ -279,35 +274,53 @@ fn parse_destlist_scan(data: &[u8], _artifact_path: &str, max_entries: usize) ->
         let val = r_u64(data, i);
         if (MIN_FT..=MAX_FT).contains(&val) {
             let ns = crate::types::filetime_to_unix_ns(val);
-            // Scan up to 64 bytes after the FILETIME for a counted UTF-16LE string
-            let scan_end = (i + 8 + 64).min(data.len().saturating_sub(2));
+            // Scan up to 128 bytes after the FILETIME for a counted UTF-16LE string
+            let scan_end = (i + 8 + 128).min(data.len().saturating_sub(2));
+            let mut found = false;
             for k in (i + 8..scan_end).step_by(2) {
                 let len = r_u16(data, k) as usize;
-                if len > 0 && len < 256 && k + 2 + len * 2 <= data.len() {
-                    let s = r_utf16_counted(data, k + 2, len);
-                    if s.len() >= 3 && s.contains('\\') {
-                        events.push(TimelineEvent {
-                            timestamp_ns:    ns,
-                            macb:            "A".to_string(),
-                            source:          "JUMPLIST".to_string(),
-                            artifact:        "JumpList".to_string(),
-                                        message:         format!("JumpList accessed: {}", s),
-                            hostname:        None,
-                            tz_offset_secs:  0,
-                            is_fn_timestamp: false,
-                            source_hash:     None,
-                            extra: Some(EventExtra::JumpList {
-                                target_path:      s.clone(),
-                                destlist_version: None,
-                            }),
-                        });
-                        i = k + 2 + len * 2;
-                        break;
-                    }
+                if len == 0 || len > 512 { continue; }
+                if k + 2 + len * 2 > data.len() { continue; }
+
+                let s = r_utf16_counted(data, k + 2, len);
+
+                // If the string starts with ':' and the bytes at k look like a UTF-16LE
+                // drive letter (e.g. C=0x43, 0x00), the scanner landed one code unit late —
+                // the drive letter was consumed as the high byte of the "length" field.
+                // Recover the full path by reading null-terminated from k instead.
+                let s = if s.starts_with(':') && k + 1 < data.len()
+                    && data[k].is_ascii_uppercase() && data[k + 1] == 0
+                {
+                    r_utf16_null(data, k)
+                } else {
+                    s
+                };
+
+                if s.len() >= 3 && s.contains('\\') {
+                    events.push(TimelineEvent {
+                        timestamp_ns:    ns,
+                        macb:            "A".to_string(),
+                        source:          "JUMPLIST".to_string(),
+                        artifact:        "JumpList".to_string(),
+                        message:         format!("JumpList accessed: {}", s),
+                        hostname:        None,
+                        tz_offset_secs:  0,
+                        is_fn_timestamp: false,
+                        source_hash:     None,
+                        extra: Some(EventExtra::JumpList {
+                            target_path:      s.clone(),
+                            destlist_version: None,
+                        }),
+                    });
+                    i = k + 2 + len * 2;
+                    found = true;
+                    break;
                 }
             }
+            if !found { i += 4; }
+        } else {
+            i += 4;
         }
-        i += 4;
     }
     events
 }

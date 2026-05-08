@@ -40,12 +40,13 @@ const BX_HEX32:   u8 = 0x14; // 4-byte int displayed as hex (HexInt32)
 /// Minimal EVTX event record extracted from a chunk
 #[derive(Debug, Clone)]
 struct EvtxRecord {
-    timestamp_ns: i64,
-    event_id: u32,
-    channel: String,
-    computer: String,
-    snippet: Option<String>,  // extra context appended after base message
-    level: u8,
+    timestamp_ns:  i64,
+    event_id:      u32,
+    record_number: u64,
+    channel:       String,
+    computer:      String,
+    snippet:       Option<String>,
+    level:         u8,
 }
 
 fn event_name(id: u32) -> Option<&'static str> {
@@ -750,32 +751,48 @@ fn extract_ps_snippet(data: &[u8]) -> Option<String> {
 /// Generic snippet extractor for all event IDs without a specific handler.
 /// Scans the entire BinXML payload (from record offset 0x18) for meaningful strings.
 /// Priority: path strings (contain '\') → description strings (contain space) → longest.
+/// Returns true for strings that are structural noise even in substitution values —
+/// GUIDs, URL-like strings, strings starting with `{`, single chars, etc.
+fn is_generic_noise(s: &str) -> bool {
+    if s.len() <= 2 { return true; }
+    // GUIDs: {xxxxxxxx-xxxx-...} or bare 36-char form with 4 hyphens
+    if s.starts_with('{') { return true; }
+    if s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4 { return true; }
+    // URLs / URIs
+    if s.contains("://") { return true; }
+    // Script body fragments
+    if s.contains('\n') || s.contains('\r') || s.starts_with('#') { return true; }
+    // Pure numbers (IDs, status codes)
+    if s.chars().all(|c| c.is_ascii_digit() || c == '-') { return true; }
+    // Provider / channel names already in message header
+    if s.starts_with("Microsoft-") || s.starts_with("Microsoft ") { return true; }
+    if is_noise_string(s) { return true; }
+    false
+}
+
 fn extract_generic_snippet(data: &[u8]) -> Option<String> {
     if data.len() <= 0x18 { return None; }
     let xml_data = &data[0x18..];
 
-    // ── Structured path: only look at actual substitution values ──────────
+    // ── Structured path: read only actual substitution values ─────────────
+    // Take the first 3 clean values in document order (field order matches
+    // the EventData XML order) and join them.  This mirrors plaso's approach
+    // of showing the strings array rather than guessing which one matters.
     if let Some((val_start, types, sizes)) = parse_subst_table(xml_data) {
         let all_strs = subst_all_strings(xml_data, val_start, &types, &sizes);
-        let mut path_s: Option<String> = None;
-        let mut desc_s: Option<String> = None;
-        let mut best_s: Option<String> = None;
-        let mut best_len = 0usize;
-        for s in all_strs {
-            if is_noise_string(&s) { continue; }
-            if path_s.is_none() && s.contains('\\') { path_s = Some(s.clone()); }
-            if desc_s.is_none() && s.contains(' ') && s.len() >= 6 { desc_s = Some(s.clone()); }
-            if s.len() >= 8 && s.len() > best_len { best_len = s.len(); best_s = Some(s); }
-        }
-        if let Some(result) = path_s.or(desc_s).or(best_s) {
-            return Some(safe_trunc(&result, 120));
+        let clean: Vec<String> = all_strs.into_iter()
+            .filter(|s| !is_generic_noise(s))
+            .take(3)
+            .map(|s| safe_trunc(&s, 80))
+            .collect();
+        if !clean.is_empty() {
+            return Some(clean.join(" | "));
         }
     }
 
-    // ── Fallback: byte scan ───────────────────────────────────────────────
+    // ── Fallback byte scan (first-occurrence inline-template records) ──────
     let scan_start = 0x18usize;
     let mut path_s: Option<String> = None;
-    let mut desc_s: Option<String> = None;
     let mut best_s: Option<String> = None;
     let mut best_len = 0usize;
     let mut i = scan_start;
@@ -784,12 +801,11 @@ fn extract_generic_snippet(data: &[u8]) -> Option<String> {
         let hi = data[i + 1];
         if hi != 0 || lo < 0x20 { i += 1; continue; }
         let (len, end) = measure_utf16le_run(data, i);
-        if len >= 4 {
-            if let Some(s) = extract_utf16le_str(data, i, len.min(240)) {
-                if !is_noise_string(&s) {
+        if len >= 6 {
+            if let Some(s) = extract_utf16le_str(data, i, len.min(160)) {
+                if !is_generic_noise(&s) {
                     if path_s.is_none() && s.contains('\\') { path_s = Some(s.clone()); }
-                    if desc_s.is_none() && s.contains(' ') && len >= 6 { desc_s = Some(s.clone()); }
-                    if len >= 8 && len > best_len { best_len = len; best_s = Some(s); }
+                    if len > best_len { best_len = len; best_s = Some(s); }
                 }
             }
             i = end + 1;
@@ -797,7 +813,7 @@ fn extract_generic_snippet(data: &[u8]) -> Option<String> {
             i += 1;
         }
     }
-    let result = path_s.or(desc_s).or(best_s)?;
+    let result = path_s.or(best_s)?;
     Some(safe_trunc(&result, 120))
 }
 
@@ -817,27 +833,23 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
         return None;
     }
 
-    let timestamp_ft = r_u64(data, 0x10);
-    let timestamp_ns = filetime_to_unix_ns(timestamp_ft);
+    // Event record header layout:
+    //   0x00  4 bytes  magic 0x2a2a0000
+    //   0x04  4 bytes  record size
+    //   0x08  8 bytes  record number (u64)
+    //   0x10  8 bytes  timestamp (FILETIME)
+    let record_number = r_u64(data, 0x08);
+    let timestamp_ft  = r_u64(data, 0x10);
+    let timestamp_ns  = filetime_to_unix_ns(timestamp_ft);
 
-    // BinXML starts at offset 0x18
-    // We do a fast scan for key strings rather than full BinXML parse
-    // This gives ~10x speed advantage for batch processing
     let xml_data = &data[0x18..];
 
     let mut event_id: u32 = 0;
     let computer = String::new();
-    let level: u8 = 0;
 
-    // EventID is stored in the BinXML substitution value array.
-    // For standard Windows events the substitution value area starts at
-    // a consistent BinXML offset (0x5E = 94), so the EventID uint16 is
-    // always at raw record offset 0x18 + 0x5E = 0x76 = 118.
-    // Validated empirically against Security, System, Application, PowerShell
-    // event logs (4624, 4672, 4634, 4648, 5058, 5059, 5061, 5379, 5382…).
-    // For atypical events with a different template layout (e.g. 4907)
-    // we fall back to 0 rather than returning a wrong value.
-    const EID_BINXML_OFFSET: usize = 0x5E; // = record offset 0x76 minus header 0x18
+    // EventID: substitution value area starts at BinXML offset 0x5E for standard events.
+    // Raw record offset = 0x18 + 0x5E = 0x76.
+    const EID_BINXML_OFFSET: usize = 0x5E;
     if xml_data.len() > EID_BINXML_OFFSET + 2 {
         let candidate = r_u16(xml_data, EID_BINXML_OFFSET) as u32;
         if candidate > 0 && candidate < 65536 {
@@ -845,15 +857,21 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
         }
     }
 
+    // Event level is at BinXML offset 0x60 (immediately after EventID u16 + 2 pad bytes).
+    // Level: 0=LogAlways, 1=Critical, 2=Error, 3=Warning, 4=Info, 5=Verbose.
+    const LEVEL_BINXML_OFFSET: usize = 0x62;
+    let level: u8 = if xml_data.len() > LEVEL_BINXML_OFFSET {
+        xml_data[LEVEL_BINXML_OFFSET]
+    } else {
+        0
+    };
+
     let channel = scan_for_channel(data);
 
     // Extract a contextual snippet for every event.
-    // Priority: event-specific handler → generic substitution-table extractor.
     let specific_snippet = match event_id {
         4103 | 4104 => extract_ps_snippet(data),
-        // with_logon_type=true only for events that actually carry a LogonType field
         4624 | 4625 | 4648 => extract_logon_snippet(data, true),
-        // account-name only — no LogonType field in these events
         4634 | 4647 | 4672 | 4776 => extract_logon_snippet(data, false),
         _ => None,
     };
@@ -862,6 +880,7 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
     Some(EvtxRecord {
         timestamp_ns,
         event_id,
+        record_number,
         channel,
         computer,
         snippet,
@@ -927,12 +946,19 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
                     rec.channel = stem.replace("%4", "/");
                 }
             }
-            // Build final message once the channel is finalised, preserving any snippet
+            // Level prefix: only surface Error and Warning — Info/Verbose are silent
+            let level_prefix = match rec.level {
+                1 => " [CRITICAL]",
+                2 => " [ERROR]",
+                3 => " [WARNING]",
+                _ => "",
+            };
+
             let base = match (event_name(rec.event_id), rec.channel.is_empty()) {
-                (Some(name), false) => format!("EventID {} - {} [{}]", rec.event_id, name, rec.channel),
-                (Some(name), true)  => format!("EventID {} - {}", rec.event_id, name),
-                (None, false)       => format!("EventID {} [{}]", rec.event_id, rec.channel),
-                (None, true)        => format!("EventID {}", rec.event_id),
+                (Some(name), false) => format!("EventID {}{} - {} [{}]", rec.event_id, level_prefix, name, rec.channel),
+                (Some(name), true)  => format!("EventID {}{} - {}", rec.event_id, level_prefix, name),
+                (None, false)       => format!("EventID {}{} [{}]", rec.event_id, level_prefix, rec.channel),
+                (None, true)        => format!("EventID {}{}", rec.event_id, level_prefix),
             };
             let message = match &rec.snippet {
                 Some(s) => format!("{} - {}", base, s),
@@ -949,9 +975,10 @@ fn parse_evtx_chunk(chunk: &[u8], artifact_path: &str) -> Vec<TimelineEvent> {
                 is_fn_timestamp: false,
                 source_hash: None,
                 extra: Some(EventExtra::Evtx {
-                    event_id: rec.event_id,
-                    channel:  rec.channel.clone(),
-                    level:    rec.level,
+                    event_id:      rec.event_id,
+                    record_number: rec.record_number,
+                    channel:       rec.channel.clone(),
+                    level:         rec.level,
                 }),
             });
         }
@@ -1000,9 +1027,11 @@ pub fn parse_evtx_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;
-        if let Some(EventExtra::Evtx { event_id, channel, .. }) = &ev.extra {
-            dict.set_item("event_id", event_id)?;
-            dict.set_item("channel", channel.as_str())?;
+        if let Some(EventExtra::Evtx { event_id, record_number, channel, level }) = &ev.extra {
+            dict.set_item("event_id",      event_id)?;
+            dict.set_item("record_number", record_number)?;
+            dict.set_item("channel",       channel.as_str())?;
+            dict.set_item("level",         level)?;
         }
         list.append(dict)?;
     }

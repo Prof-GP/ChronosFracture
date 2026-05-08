@@ -47,6 +47,17 @@ pip install .
 
 `pip install .` compiles the Rust core automatically — no separate build step needed. First build takes 2–5 minutes; rebuilds are ~30 seconds.
 
+> **Python 3.13+ / newer Python than pyo3 supports:** If the build fails with a pyo3 ABI compatibility error, set this environment variable before running `pip install .`:
+> ```powershell
+> # Windows PowerShell
+> $env:PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
+> pip install .
+> ```
+> ```bash
+> # bash / zsh
+> PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 pip install .
+> ```
+
 ### Verify
 
 ```bash
