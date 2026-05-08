@@ -288,6 +288,49 @@ def _tsk_extract_dir(fs_obj, inode_path: str, dest_dir: str) -> int:
     return count
 
 
+def _tsk_extract_user_hives(fs_obj, tmp_dir: str) -> int:
+    """
+    Enumerate Users/ and extract each user's NTUSER.DAT and UsrClass.dat.
+
+    Output structure:
+        <tmp_dir>/userhives/<username>/NTUSER.DAT
+        <tmp_dir>/userhives/<username>/UsrClass.dat
+    """
+    count = 0
+    dest_root = os.path.join(tmp_dir, "userhives")
+    try:
+        users_dir = fs_obj.open_dir("Users")
+    except Exception:
+        return 0
+
+    for entry in users_dir:
+        name = entry.info.name.name
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", errors="replace")
+        if name in (".", "..", "All Users", "Default", "Default User", "Public"):
+            continue
+        if not (entry.info.meta and entry.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR):
+            continue
+
+        user_dest = os.path.join(dest_root, name)
+        os.makedirs(user_dest, exist_ok=True)
+
+        for src_rel, dest_name in [
+            (f"Users/{name}/NTUSER.DAT",
+             "NTUSER.DAT"),
+            (f"Users/{name}/AppData/Local/Microsoft/Windows/UsrClass.dat",
+             "UsrClass.dat"),
+        ]:
+            dest_file = os.path.join(user_dest, dest_name)
+            try:
+                if _tsk_extract_file(fs_obj, src_rel, dest_file):
+                    count += 1
+            except Exception:
+                continue
+
+    return count
+
+
 def _tsk_extract_user_recent(fs_obj, tmp_dir: str) -> int:
     """
     Enumerate Users/ on the filesystem and extract each user's Recent/ directory.
@@ -475,6 +518,11 @@ def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
         if progress_cb:
             progress_cb("Users/*/AppData/Roaming/Microsoft/Windows/Recent")
         _tsk_extract_user_recent(fs, tmp_dir)
+
+        # Per-user registry hives (NTUSER.DAT + UsrClass.dat)
+        if progress_cb:
+            progress_cb("Users/*/NTUSER.DAT + UsrClass.dat")
+        _tsk_extract_user_hives(fs, tmp_dir)
 
         return tmp_dir
 

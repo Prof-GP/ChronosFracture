@@ -55,6 +55,31 @@ ARTIFACT_PATTERNS: List[tuple[str, str, bool]] = [
     # User activity artifacts (per-user, wildcard paths)
     ("LNK",       "Users/*/AppData/Roaming/Microsoft/Windows/Recent/",     True),
 
+    # Scheduled Tasks
+    ("TASK",       "Windows/System32/Tasks/",                               True),
+
+    # Browser artifacts (Chrome, Edge, Firefox)
+    ("BROWSER",    "Users/*/AppData/Local/Google/Chrome/User Data/Default/History",                False),
+    ("BROWSER",    "Users/*/AppData/Local/Google/Chrome/User Data/*/History",                      False),
+    ("BROWSER",    "Users/*/AppData/Local/Microsoft/Edge/User Data/Default/History",               False),
+    ("BROWSER",    "Users/*/AppData/Local/Microsoft/Edge/User Data/*/History",                     False),
+    ("BROWSER",    "Users/*/AppData/Roaming/Mozilla/Firefox/Profiles/*/places.sqlite",             False),
+
+    # Windows Timeline (ActivitiesCache.db)
+    ("WINTIMELINE","Users/*/AppData/Local/ConnectedDevicesPlatform/*/ActivitiesCache.db",          False),
+
+    # Deletion / crash artifacts
+    ("RECYCLEBIN", "$Recycle.Bin/",                                         True),
+    ("WER",        "Users/*/AppData/Local/Microsoft/Windows/WER/ReportArchive/*/*.wer", False),
+    ("WER",        "ProgramData/Microsoft/Windows/WER/ReportArchive/*/*.wer",           False),
+
+    # Per-user shell artifacts
+    ("PSHISTORY",  "Users/*/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt", False),
+
+    # ShellBags — UsrClass.dat is the primary source; NTUSER.DAT is secondary
+    ("SHELLBAG",  "Users/*/AppData/Local/Microsoft/Windows/UsrClass.dat",  False),
+    ("SHELLBAG",  "Users/*/NTUSER.DAT",                                    False),
+
     # Registry hives
     ("REGISTRY",  "Windows/System32/config/SYSTEM",                        False),
     ("REGISTRY",  "Windows/System32/config/SOFTWARE",                      False),
@@ -248,6 +273,21 @@ def _dispatch_rust(job: ArtifactJob, mft_path_map=None) -> List[Dict[str, Any]]:
         from supertimeline.parsers.lnk import parse_dir as parse_lnk_dir
         return parse_lnk_dir(job.path)
 
+    if job.artifact_type == "TASK":
+        return list(_core.parse_tasks_dir(job.path))
+
+    if job.artifact_type == "SHELLBAG":
+        return list(_core.parse_shellbags(job.path))
+
+    if job.artifact_type == "RECYCLEBIN":
+        return list(_core.parse_recyclebin_dir(job.path))
+
+    if job.artifact_type == "PSHISTORY":
+        return list(_core.parse_pshistory_file(job.path))
+
+    if job.artifact_type == "WER":
+        return list(_core.parse_wer_file(job.path))
+
     # Fall through to Python parsers for remaining types
     return _dispatch_python(job)
 
@@ -272,6 +312,14 @@ def _dispatch_python(job: ArtifactJob) -> List[Dict[str, Any]]:
     if job.artifact_type == "AMCACHE":
         from supertimeline.parsers.amcache import parse_amcache
         return parse_amcache(job.path)
+
+    if job.artifact_type == "BROWSER":
+        from supertimeline.parsers.browser import parse_browser_db
+        return parse_browser_db(job.path)
+
+    if job.artifact_type == "WINTIMELINE":
+        from supertimeline.parsers.wintimeline import parse_wintimeline
+        return parse_wintimeline(job.path)
 
     if job.artifact_type == "PCASVC":
         from supertimeline.parsers.pcasvc import parse
@@ -376,6 +424,33 @@ def _discover_from_extracted(root: str) -> List[ArtifactJob]:
                 is_directory=False,
                 logical_path=_LOGICAL_PATH_MAP.get(flat_name, flat_name),
             ))
+
+    # Per-user registry hives (NTUSER.DAT = REGISTRY + SHELLBAG; UsrClass.dat = REGISTRY + SHELLBAG)
+    userhives_root = root_path / "userhives"
+    if userhives_root.is_dir():
+        for user_dir in userhives_root.iterdir():
+            if not user_dir.is_dir():
+                continue
+            for hive_name, artifact_types in [
+                ("NTUSER.DAT",   ["REGISTRY", "SHELLBAG"]),
+                ("UsrClass.dat", ["REGISTRY", "SHELLBAG"]),
+            ]:
+                hive_file = user_dir / hive_name
+                if not hive_file.is_file():
+                    continue
+                try:
+                    size = hive_file.stat().st_size
+                except OSError:
+                    size = 0
+                for atype in artifact_types:
+                    logical = f"Users\\{user_dir.name}\\{hive_name}"
+                    jobs.append(ArtifactJob(
+                        artifact_type=atype,
+                        path=str(hive_file),
+                        size_bytes=size,
+                        is_directory=False,
+                        logical_path=logical,
+                    ))
 
     jobs.sort(key=lambda j: j.size_bytes, reverse=True)
     log.info("Extracted temp dir: found %d artifact jobs in %s", len(jobs), root)

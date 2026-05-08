@@ -176,6 +176,13 @@ def _rot13(s: str) -> str:
     return codecs.encode(s, "rot_13")
 
 
+def _looks_like_hex(s: str) -> bool:
+    """True when _decode_reg_value returned a raw hex dump (not a human-readable string)."""
+    # Hex dumps are all hex chars optionally ending in "..."
+    core = s.rstrip(".").rstrip()
+    return len(core) >= 8 and all(c in "0123456789abcdefABCDEF" for c in core)
+
+
 def _registry_plugin(
     full_path: str,
     key_name: str,
@@ -244,17 +251,65 @@ def _registry_plugin(
 
     # ── MRU: RecentDocs ───────────────────────────────────────────────────────
     if "\\RECENTDOCS" in upper:
-        # Subkeys are file extensions; values are binary shell item lists
-        # Just annotate the key for context
+        # Values are binary shell item lists; extract any REG_SZ values present
+        str_vals = [
+            v for n, v in values[:10]
+            if n.lower() not in ("mrulistex", "mrulist", "(default)")
+            and v and not _looks_like_hex(v)
+        ]
+        if str_vals:
+            return "MRU", "RecentDocs: " + "; ".join(str_vals[:5])
         return "MRU", f"RecentDocs: {key_name} | {full_path}"
 
-    # ── MRU: OpenSavePidlMRU ─────────────────────────────────────────────────
+    # ── MRU: OpenSavePidlMRU (binary shell items) ────────────────────────────
     if "\\OPENSAVEPIDLMRU" in upper:
         return "MRU", f"OpenSave MRU: {key_name} | {full_path}"
 
-    # ── MRU: ComDlg32 OpenSaveFileName ───────────────────────────────────────
+    # ── MRU: OpenSaveMRU / OpenSaveFileName (REG_SZ — extractable) ───────────
     if "\\OPENSAVEFILENAME" in upper or "\\OPENSAVEMRU" in upper:
+        str_vals = [
+            v for n, v in values[:10]
+            if n.lower() not in ("mrulist", "mrulistex", "(default)")
+            and v and not _looks_like_hex(v)
+        ]
+        if str_vals:
+            return "MRU", "OpenSave MRU: " + "; ".join(str_vals[:5])
         return "MRU", f"OpenSave MRU: {key_name} | {full_path}"
+
+    # ── MRU: LastVisitedPidlMRU / LastVisitedMRU (folder open dialog history) ─
+    if "\\LASTVISITEDPIDLMRU" in upper or "\\LASTVISITEDMRU" in upper:
+        str_vals = [
+            v for n, v in values[:10]
+            if n.lower() not in ("mrulist", "mrulistex", "(default)")
+            and v and not _looks_like_hex(v)
+        ]
+        if str_vals:
+            return "MRU", "LastVisited MRU: " + "; ".join(str_vals[:5])
+        return "MRU", f"LastVisited MRU: {key_name} | {full_path}"
+
+    # ── MRU: Office File MRU (Word / Excel / PowerPoint / etc.) ──────────────
+    # Path: Software\Microsoft\Office\{ver}\{app}\File MRU
+    #       Software\Microsoft\Office\{ver}\{app}\User MRU\{id}\File MRU
+    if "\\OFFICE\\" in upper and (upper.endswith("\\FILE MRU") or upper.endswith("\\PLACE MRU")):
+        files = []
+        for vname, val in values[:10]:
+            if not vname.startswith("Item "):
+                continue
+            # Format: [F00000000][T<filetime_hex>][O20]C:\path\to\file.ext
+            path = val[val.rfind("]") + 1:].strip() if "]" in val else val.strip()
+            if path:
+                files.append(path.split("\\")[-1])
+        if files:
+            return "MRU", "Office MRU: " + "; ".join(files[:5])
+        return "MRU", f"Office MRU: {full_path}"
+
+    # ── ShellBags: BagMRU (folder browsing history) ───────────────────────────
+    # NTUSER: Software\Microsoft\Windows\Shell\BagMRU\...
+    # UsrClass: Local Settings\Software\Microsoft\Windows\Shell\BagMRU\...
+    if "\\BAGMRU" in upper:
+        # key_name is the numeric slot under BagMRU — not the decoded path.
+        # Full shell item decoding is handled by the dedicated ShellBags parser (3.7).
+        return "ShellBag", f"ShellBag: {full_path}"
 
     return None
 
