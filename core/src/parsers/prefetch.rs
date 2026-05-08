@@ -47,6 +47,7 @@ fn read_utf16_le(data: &[u8], off: usize, max_chars: usize) -> String {
 struct PrefetchRecord {
     exe_name: String,
     exe_path: String,  // full path from Section C file name strings
+    modules: Vec<String>, // top Section C paths for DLL hijack detection (cap 10)
     run_count: u32,
     last_run_times: Vec<u64>, // FILETIME values
     hash: u32,
@@ -113,6 +114,7 @@ fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord>
     let sec_c_len = read_u32_le(data, 0x68) as usize;
     let sec_c_strings = read_section_c_strings(data, sec_c_off, sec_c_len);
     let exe_path = find_exe_path(&sec_c_strings, &exe_name);
+    let modules: Vec<String> = sec_c_strings.into_iter().take(10).collect();
 
     // Run count offset is version-specific.
     // V30 (Win10) / V26 (Win8): 0xD0 (confirmed against windowsprefetch).
@@ -155,6 +157,7 @@ fn parse_prefetch_bytes(data: &[u8], _file_path: &str) -> Option<PrefetchRecord>
     Some(PrefetchRecord {
         exe_name,
         exe_path,
+        modules,
         run_count,
         last_run_times,
         hash,
@@ -181,6 +184,7 @@ fn events_from_record(rec: PrefetchRecord, _path_str: &str) -> Vec<TimelineEvent
                 run_count:     rec.run_count,
                 prefetch_hash: format!("{:08X}", rec.hash),
                 version:       rec.version as u32,
+                modules:       rec.modules.clone(),
             }),
         })
         .collect()
@@ -239,11 +243,14 @@ pub fn parse_prefetch_bytes_decompressed(
         dict.set_item("message",         &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
-        if let Some(EventExtra::Prefetch { exe_name, exe_path, run_count, .. }) = &ev.extra {
+        if let Some(EventExtra::Prefetch { exe_name, exe_path, run_count, modules, .. }) = &ev.extra {
             dict.set_item("file_path", if !exe_path.is_empty() { exe_path.as_str() } else { exe_name.as_str() })?;
             dict.set_item("exe_name",  exe_name.as_str())?;
             dict.set_item("exe_path",  exe_path.as_str())?;
             dict.set_item("run_count", run_count)?;
+            let mlist = PyList::empty_bound(py);
+            for m in modules { mlist.append(m.as_str())?; }
+            dict.set_item("modules", mlist)?;
         }
         list.append(dict)?;
     }
@@ -283,11 +290,14 @@ pub fn parse_prefetch_dir(py: Python<'_>, dir_path: &str) -> PyResult<Py<PyList>
         dict.set_item("message", &ev.message)?;
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;
-        if let Some(EventExtra::Prefetch { exe_name, exe_path, run_count, .. }) = &ev.extra {
+        if let Some(EventExtra::Prefetch { exe_name, exe_path, run_count, modules, .. }) = &ev.extra {
             dict.set_item("file_path", if !exe_path.is_empty() { exe_path.as_str() } else { exe_name.as_str() })?;
             dict.set_item("exe_name",  exe_name.as_str())?;
             dict.set_item("exe_path",  exe_path.as_str())?;
             dict.set_item("run_count", run_count)?;
+            let mlist = PyList::empty_bound(py);
+            for m in modules { mlist.append(m.as_str())?; }
+            dict.set_item("modules", mlist)?;
         }
         list.append(dict)?;
     }

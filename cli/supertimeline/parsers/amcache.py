@@ -149,6 +149,121 @@ def _parse_legacy_amcache(root_key, artifact_path: str) -> List[Dict[str, Any]]:
     return events
 
 
+def _parse_inventory_driver_binary(root_key, artifact_path: str) -> List[Dict[str, Any]]:
+    """Root\InventoryDriverBinary — driver SHA1, inf path, driver type."""
+    events: List[Dict[str, Any]] = []
+
+    drv_key = None
+    for path in (
+        ["InventoryDriverBinary"],
+        ["Root", "InventoryDriverBinary"],
+    ):
+        try:
+            k = root_key
+            for part in path:
+                k = k.subkey(part)
+            drv_key = k
+            break
+        except Exception:
+            continue
+
+    if drv_key is None:
+        return events
+
+    for entry_key in drv_key.subkeys():
+        try:
+            drv_path = (
+                _safe_value(entry_key, "ImagePath")
+                or _safe_value(entry_key, "DriverName")
+                or entry_key.name()
+            )
+            sha1     = _safe_value(entry_key, "DriverCheckSum") or ""
+            inf_path = _safe_value(entry_key, "InfPath") or ""
+            signed   = _safe_value(entry_key, "WheaErrorSourceCount")  # repurpose: IsSigned
+            signed   = _safe_value(entry_key, "IsSigned")
+            drv_type = _safe_value(entry_key, "DriverType") or ""
+
+            ts_ns = _regtime_to_ns(entry_key.timestamp())
+            if ts_ns == 0:
+                continue
+
+            parts = [drv_path]
+            if inf_path:
+                parts.append(f"inf={inf_path}")
+            if sha1:
+                parts.append(f"csum={sha1}")
+            if drv_type:
+                parts.append(f"type={drv_type}")
+
+            events.append({
+                "timestamp_ns": ts_ns,
+                "macb": "M",
+                "source": "AMCACHE",
+                "artifact": "Amcache.hve InventoryDriverBinary",
+                "file_path": drv_path,
+                "message": " | ".join(parts),
+                "is_fn_timestamp": False,
+            })
+        except Exception:
+            continue
+
+    return events
+
+
+def _parse_inventory_application(root_key, artifact_path: str) -> List[Dict[str, Any]]:
+    """Root\InventoryApplication — installed software timeline."""
+    events: List[Dict[str, Any]] = []
+
+    app_key = None
+    for path in (
+        ["InventoryApplication"],
+        ["Root", "InventoryApplication"],
+    ):
+        try:
+            k = root_key
+            for part in path:
+                k = k.subkey(part)
+            app_key = k
+            break
+        except Exception:
+            continue
+
+    if app_key is None:
+        return events
+
+    for entry_key in app_key.subkeys():
+        try:
+            name      = _safe_value(entry_key, "Name") or entry_key.name()
+            publisher = _safe_value(entry_key, "Publisher") or ""
+            version   = _safe_value(entry_key, "Version") or ""
+            install_dt = _safe_value(entry_key, "InstallDate") or ""
+
+            ts_ns = _regtime_to_ns(entry_key.timestamp())
+            if ts_ns == 0:
+                continue
+
+            parts = [name]
+            if publisher:
+                parts.append(f"pub={publisher}")
+            if version:
+                parts.append(f"ver={version}")
+            if install_dt:
+                parts.append(f"installed={install_dt}")
+
+            events.append({
+                "timestamp_ns": ts_ns,
+                "macb": "M",
+                "source": "AMCACHE",
+                "artifact": "Amcache.hve InventoryApplication",
+                "message": " | ".join(parts),
+                "is_fn_timestamp": False,
+            })
+        except Exception:
+            continue
+
+    return events
+
+
 def parse_amcache(path: str) -> List[Dict[str, Any]]:
     """Parse Amcache.hve and return timeline events."""
     try:
@@ -163,6 +278,8 @@ def parse_amcache(path: str) -> List[Dict[str, Any]]:
 
         # Win10+ path
         events.extend(_parse_inventory_application_file(root, path))
+        events.extend(_parse_inventory_driver_binary(root, path))
+        events.extend(_parse_inventory_application(root, path))
 
         # Win7 legacy path
         if not events:

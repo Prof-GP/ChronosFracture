@@ -17,11 +17,17 @@ const LNK_CLSID: [u8; 16] = [
 ];
 
 // LinkFlags (offset 0x14 in header)
-const FL_HAS_ID_LIST:   u32 = 0x0001;
-const FL_HAS_LINK_INFO: u32 = 0x0002;
-const FL_HAS_NAME:      u32 = 0x0004;
-const FL_HAS_REL_PATH:  u32 = 0x0008;
-const FL_IS_UNICODE:    u32 = 0x0080;
+const FL_HAS_ID_LIST:      u32 = 0x0001;
+const FL_HAS_LINK_INFO:    u32 = 0x0002;
+const FL_HAS_NAME:         u32 = 0x0004;
+const FL_HAS_REL_PATH:     u32 = 0x0008;
+const FL_HAS_WORKING_DIR:  u32 = 0x0010;
+const FL_HAS_ARGUMENTS:    u32 = 0x0020;
+const FL_HAS_ICON_LOC:     u32 = 0x0040;
+const FL_IS_UNICODE:       u32 = 0x0080;
+
+// ExtraData block signature for TrackerDataBlock (DROID tracking)
+const SIG_TRACKER: u32 = 0xA000_0003;
 
 fn drive_type_str(t: u32) -> &'static str {
     match t {
@@ -39,8 +45,49 @@ pub(crate) struct LnkParsed {
     pub(crate) drive_type:   u32,
     pub(crate) drive_serial: u32,
     pub(crate) volume_label: String,
+    pub(crate) arguments:    String,
+    pub(crate) machine_id:   String,
+    pub(crate) droid_file_id: String,
     /// Embedded target FILETIME values: (creation, access, write)
     pub(crate) target_times: (u64, u64, u64),
+}
+
+fn format_guid(data: &[u8], off: usize) -> String {
+    if off + 16 > data.len() { return String::new(); }
+    let d1 = r_u32(data, off);
+    let d2 = r_u16(data, off + 4);
+    let d3 = r_u16(data, off + 6);
+    format!("{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        d1, d2, d3,
+        data[off+8], data[off+9],
+        data[off+10], data[off+11], data[off+12], data[off+13], data[off+14], data[off+15])
+}
+
+/// Scan ExtraData blocks starting at `off` for a TrackerDataBlock (signature 0xA0000003).
+/// Returns (machine_id, droid_file_id) on success.
+fn find_tracker_block(data: &[u8], mut off: usize) -> Option<(String, String)> {
+    while off + 8 <= data.len() {
+        let blk_size = r_u32(data, off) as usize;
+        if blk_size < 8 || off + blk_size > data.len() { break; }
+        let blk_sig = r_u32(data, off + 4);
+        if blk_sig == SIG_TRACKER && blk_size >= 88 {
+            // TrackerDataBlock layout (relative to block start):
+            //   +0  BlockSize (4)
+            //   +4  BlockSignature (4)
+            //   +8  Length (4)     = 0x58 (88 − 8)
+            //   +12 Version (4)
+            //   +16 MachineID (16 bytes, null-padded ASCII)
+            //   +32 Droid[0] VolumeID GUID (16 bytes)
+            //   +48 Droid[1] FileID GUID (16 bytes)
+            //   +64 DroidBirth[0] (16 bytes)
+            //   +80 DroidBirth[1] (16 bytes)
+            let machine_id   = r_ascii_null(data, off + 16);
+            let droid_file_id = format_guid(data, off + 48);
+            return Some((machine_id, droid_file_id));
+        }
+        off += blk_size;
+    }
+    None
 }
 
 /// Parse raw LNK bytes.  Returns None if data is not a valid Shell Link file.
@@ -125,34 +172,56 @@ pub(crate) fn parse_lnk_bytes_inner(data: &[u8]) -> Option<LnkParsed> {
         off = li_start + li_size;
     }
 
-    // StringData: try to get RelativePath if still no target
-    if target_path.is_empty() {
-        let is_uni = flags & FL_IS_UNICODE != 0;
+    // StringData — traverse unconditionally to reach CommandLineArguments
+    let is_uni  = flags & FL_IS_UNICODE != 0;
+    let char_w  = if is_uni { 2usize } else { 1usize };
 
-        // Skip NameString
-        if flags & FL_HAS_NAME != 0 && off + 2 <= data.len() {
-            let n = r_u16(data, off) as usize;
-            off += 2 + if is_uni { n * 2 } else { n };
-        }
-        // RelativePath
-        if flags & FL_HAS_REL_PATH != 0 && off + 2 <= data.len() {
-            let n = r_u16(data, off) as usize;
-            off += 2;
-            if n > 0 {
-                target_path = if is_uni {
-                    r_utf16_counted(data, off, n)
-                } else {
-                    r_ascii_null(data, off)
-                };
-            }
-        }
+    // NameString
+    if flags & FL_HAS_NAME != 0 && off + 2 <= data.len() {
+        let n = r_u16(data, off) as usize;
+        off += 2 + n * char_w;
     }
+    // RelativePath — capture only if LinkInfo gave us nothing
+    if flags & FL_HAS_REL_PATH != 0 && off + 2 <= data.len() {
+        let n = r_u16(data, off) as usize;
+        off += 2;
+        if n > 0 && target_path.is_empty() {
+            target_path = if is_uni { r_utf16_counted(data, off, n) } else { r_ascii_null(data, off) };
+        }
+        off += n * char_w;
+    }
+    // WorkingDir — skip
+    if flags & FL_HAS_WORKING_DIR != 0 && off + 2 <= data.len() {
+        let n = r_u16(data, off) as usize;
+        off += 2 + n * char_w;
+    }
+    // CommandLineArguments
+    let mut arguments = String::new();
+    if flags & FL_HAS_ARGUMENTS != 0 && off + 2 <= data.len() {
+        let n = r_u16(data, off) as usize;
+        off += 2;
+        if n > 0 {
+            arguments = if is_uni { r_utf16_counted(data, off, n) } else { r_ascii_null(data, off) };
+        }
+        off += n * char_w;
+    }
+    // IconLocation — skip to reach ExtraData
+    if flags & FL_HAS_ICON_LOC != 0 && off + 2 <= data.len() {
+        let n = r_u16(data, off) as usize;
+        off += 2 + n * char_w;
+    }
+
+    // ExtraData — scan for TrackerDataBlock (DROID tracking identifiers)
+    let (machine_id, droid_file_id) = find_tracker_block(data, off).unwrap_or_default();
 
     Some(LnkParsed {
         target_path,
         drive_type,
         drive_serial,
         volume_label,
+        arguments,
+        machine_id,
+        droid_file_id,
         target_times: (target_create_ft, target_access_ft, target_write_ft),
     })
 }
@@ -182,6 +251,18 @@ pub(crate) fn events_from_lnk(parsed: LnkParsed, _lnk_path: &str) -> Vec<Timelin
         String::new()
     };
 
+    let args_suffix = if parsed.arguments.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parsed.arguments)
+    };
+
+    let machine_suffix = if parsed.machine_id.is_empty() {
+        String::new()
+    } else {
+        format!("; tracked:{}", parsed.machine_id)
+    };
+
     let make = |ft: u64, macb: &'static str, verb: &'static str| -> Option<TimelineEvent> {
         if ft == 0 { return None; }
         let ns = filetime_to_unix_ns(ft);
@@ -191,16 +272,19 @@ pub(crate) fn events_from_lnk(parsed: LnkParsed, _lnk_path: &str) -> Vec<Timelin
             macb:            macb.to_string(),
             source:          "LNK".to_string(),
             artifact:        "LNK".to_string(),
-            message:         format!("{}: {}{}", verb, target, vol_info),
+            message:         format!("{}: {}{}{}{}", verb, target, args_suffix, vol_info, machine_suffix),
             hostname:        None,
             tz_offset_secs:  0,
             is_fn_timestamp: false,
             source_hash:     None,
             extra: Some(EventExtra::Lnk {
-                target_path:  parsed.target_path.clone(),
-                drive_type:   parsed.drive_type,
-                drive_serial: format!("{:08X}", parsed.drive_serial),
-                volume_label: parsed.volume_label.clone(),
+                target_path:   parsed.target_path.clone(),
+                drive_type:    parsed.drive_type,
+                drive_serial:  format!("{:08X}", parsed.drive_serial),
+                volume_label:  parsed.volume_label.clone(),
+                arguments:     parsed.arguments.clone(),
+                machine_id:    parsed.machine_id.clone(),
+                droid_file_id: parsed.droid_file_id.clone(),
             }),
         })
     };
@@ -225,12 +309,15 @@ fn event_to_dict<'py>(py: Python<'py>, ev: &TimelineEvent) -> PyResult<Bound<'py
     d.set_item("message",         &ev.message)?;
     d.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
     d.set_item("tz_offset_secs",  ev.tz_offset_secs)?;
-    if let Some(EventExtra::Lnk { target_path, drive_type, drive_serial, volume_label }) = &ev.extra {
-        d.set_item("file_path",    target_path.as_str())?;
-        d.set_item("target_path",  target_path.as_str())?;
-        d.set_item("drive_type",   drive_type)?;
-        d.set_item("drive_serial", drive_serial.as_str())?;
-        d.set_item("volume_label", volume_label.as_str())?;
+    if let Some(EventExtra::Lnk { target_path, drive_type, drive_serial, volume_label, arguments, machine_id, droid_file_id }) = &ev.extra {
+        d.set_item("file_path",     target_path.as_str())?;
+        d.set_item("target_path",   target_path.as_str())?;
+        d.set_item("drive_type",    drive_type)?;
+        d.set_item("drive_serial",  drive_serial.as_str())?;
+        d.set_item("volume_label",  volume_label.as_str())?;
+        d.set_item("arguments",     arguments.as_str())?;
+        d.set_item("machine_id",    machine_id.as_str())?;
+        d.set_item("droid_file_id", droid_file_id.as_str())?;
     }
     Ok(d)
 }

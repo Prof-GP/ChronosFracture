@@ -111,6 +111,16 @@ def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
+        # Collect all loaded file paths (cap at 10) for DLL hijack detection
+        modules: List[str] = []
+        try:
+            for n in range(min(scca.get_number_of_filenames(), 10)):
+                fn_str = scca.get_filename(n) or ""
+                if fn_str:
+                    modules.append(fn_str)
+        except Exception:
+            pass
+
         events    = []
 
         for i in range(8):
@@ -136,6 +146,7 @@ def _parse_via_pyscca(pf_path: Path) -> List[Dict[str, Any]]:
                 "exe_name":        exe_name,
                 "exe_path":        exe_path,
                 "run_count":       run_count,
+                "modules":         modules,
                 "message":         f"{exe_name} - Executed (run count: {run_count})",
                 "is_fn_timestamp": False,
                 "tz_offset_secs":  0,

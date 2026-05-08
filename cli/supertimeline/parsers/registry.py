@@ -4,7 +4,9 @@ Extracts last-written timestamps from NK records, building full key paths
 by traversing the parent chain so each event shows the complete path
 (e.g. HKLM\\SYSTEM\\ControlSet001\\Services\\Tcpip\\Parameters).
 Each event also lists the key's values (name=data) for quick forensic context.
+Forensically significant keys get a specialized artifact type and message.
 """
+import codecs
 import struct
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
@@ -170,6 +172,93 @@ def _read_nk_values(data: bytes, nk_off: int) -> List[Tuple[str, str]]:
     return results
 
 
+def _rot13(s: str) -> str:
+    return codecs.encode(s, "rot_13")
+
+
+def _registry_plugin(
+    full_path: str,
+    key_name: str,
+    values: List[Tuple[str, str]],
+) -> Optional[Tuple[str, str]]:
+    """
+    Return (artifact, message) override for forensically significant keys.
+    Returns None for ordinary keys (caller uses the default format).
+    """
+    upper = full_path.upper()
+
+    # ── Persistence: Run / RunOnce ────────────────────────────────────────────
+    if upper.endswith("\\CURRENTVERSION\\RUN"):
+        if values:
+            items = "; ".join(f"{n}={v[:70]}" for n, v in values[:6])
+            return "Persistence", f"AutoRun | {items} | {full_path}"
+        return "Persistence", f"AutoRun: {full_path}"
+
+    if upper.endswith("\\CURRENTVERSION\\RUNONCE"):
+        if values:
+            items = "; ".join(f"{n}={v[:70]}" for n, v in values[:6])
+            return "Persistence", f"AutoRunOnce | {items} | {full_path}"
+        return "Persistence", f"AutoRunOnce: {full_path}"
+
+    if upper.endswith("\\CURRENTVERSION\\RUNSERVICES"):
+        if values:
+            items = "; ".join(f"{n}={v[:70]}" for n, v in values[:6])
+            return "Persistence", f"AutoRunServices | {items} | {full_path}"
+        return "Persistence", f"AutoRunServices: {full_path}"
+
+    # ── UserAssist: ROT13-decode value names (XP-era format) ─────────────────
+    # Modern Windows stores raw paths; ROT13 handles XP. Either way decode.
+    if "\\USERASSIST\\" in upper and upper.endswith("\\COUNT"):
+        decoded = []
+        for vname, _ in values[:10]:
+            if vname == "(default)":
+                continue
+            try:
+                d = _rot13(vname)
+            except Exception:
+                d = vname
+            decoded.append(d.split("\\")[-1])
+        if decoded:
+            return "Execution", "UserAssist: " + "; ".join(decoded[:5])
+        return "Execution", f"UserAssist Count: {full_path}"
+
+    # ── BAM: Background Activity Moderator execution records ─────────────────
+    # Win10 v1803+: SYSTEM\...\BAM\State\UserSettings\{SID}
+    # Win10 pre-1803: SYSTEM\...\BAM\UserSettings\{SID}
+    if ("\\BAM\\STATE\\USERSETTINGS\\" in upper or
+            ("\\BAM\\" in upper and "\\USERSETTINGS\\" in upper)):
+        exe_names = [
+            v.split("\\")[-1] for n, v in values[:8]
+            if n != "(default)" and "\\" in v
+        ]
+        if not exe_names:
+            exe_names = [n for n, _ in values[:8] if n != "(default)"]
+        if exe_names:
+            return "BAM", "BAM last run: " + "; ".join(exe_names[:5])
+        return "BAM", f"BAM UserSettings: {full_path}"
+
+    # ── AppCompatCache / ShimCache ────────────────────────────────────────────
+    if (upper.endswith("\\APPCOMPATCACHE") or
+            upper.endswith("\\APPCOMPATFLAGS\\APPCOMPATCACHE")):
+        return "ShimCache", f"ShimCache: {full_path}"
+
+    # ── MRU: RecentDocs ───────────────────────────────────────────────────────
+    if "\\RECENTDOCS" in upper:
+        # Subkeys are file extensions; values are binary shell item lists
+        # Just annotate the key for context
+        return "MRU", f"RecentDocs: {key_name} | {full_path}"
+
+    # ── MRU: OpenSavePidlMRU ─────────────────────────────────────────────────
+    if "\\OPENSAVEPIDLMRU" in upper:
+        return "MRU", f"OpenSave MRU: {key_name} | {full_path}"
+
+    # ── MRU: ComDlg32 OpenSaveFileName ───────────────────────────────────────
+    if "\\OPENSAVEFILENAME" in upper or "\\OPENSAVEMRU" in upper:
+        return "MRU", f"OpenSave MRU: {key_name} | {full_path}"
+
+    return None
+
+
 def parse(hive_path: str) -> List[Dict[str, Any]]:
     """
     Parse a registry hive and return one timeline event per NK (registry key),
@@ -243,22 +332,28 @@ def parse(hive_path: str) -> List[Dict[str, Any]]:
         full_path = _build_full_path(nk_index, rel_off, hive_root)
         values    = nk_values.get(rel_off, [])
 
-        if values:
-            cap = 6
-            parts = [f"{n}={v}" for n, v in values[:cap]]
-            suffix = " | " + ", ".join(parts)
-            if len(values) > cap:
-                suffix += f", +{len(values) - cap} more"
-            message = full_path + suffix
+        # Check forensic plugin table first
+        plugin = _registry_plugin(full_path, _name, values)
+        if plugin:
+            artifact, message = plugin
         else:
-            message = full_path
+            artifact = "Registry Key"
+            if values:
+                cap = 6
+                parts = [f"{n}={v}" for n, v in values[:cap]]
+                suffix = " | " + ", ".join(parts)
+                if len(values) > cap:
+                    suffix += f", +{len(values) - cap} more"
+                message = full_path + suffix
+            else:
+                message = full_path
 
         events.append({
             "timestamp_ns":    ns,
             "timestamp_iso":   unix_ns_to_iso(ns),
             "macb":            "M",
             "source":          "REGISTRY",
-            "artifact":        "Registry Key",
+            "artifact":        artifact,
             "message":         message,
             "is_fn_timestamp": False,
             "tz_offset_secs":  0,

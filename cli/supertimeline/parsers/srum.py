@@ -621,6 +621,61 @@ def _parse_network_usage(records, id_map: Dict[int, str], srum_path: str) -> Lis
     return events
 
 
+# ── Network Connectivity ──────────────────────────────────────────────────────
+
+def _parse_network_connectivity(records, id_map: Dict[int, str], srum_path: str) -> List[Dict[str, Any]]:
+    from supertimeline.utils.timestamps import unix_ns_to_iso
+
+    _IFACE_TYPES: Dict[int, str] = {6: "Ethernet", 23: "PPP", 71: "WiFi", 131: "VPN"}
+
+    events: List[Dict[str, Any]] = []
+    for rec in records:
+        try:
+            # ConnectStartTime is a Windows FILETIME (stored as int64/Currency in ESE)
+            ts_ns = rec.get_timestamp_ns("ConnectStartTime")
+            if ts_ns <= 0:
+                ts_ns = rec.get_timestamp_ns("TimeStamp")
+            if ts_ns <= 0:
+                continue
+
+            app_id   = rec.get_int("AppId")
+            app_name = id_map.get(app_id, str(app_id)) if app_id is not None else "Unknown"
+
+            user_id   = rec.get_int("UserId")
+            user_name = _resolve_sid(id_map.get(user_id, str(user_id))) if user_id is not None else ""
+
+            profile       = rec.get_str("ProfileName") or ""
+            connected_sec = rec.get_int("ConnectedTime")
+            iface_type    = rec.get_int("InterfaceType")
+            iface_label   = _IFACE_TYPES.get(iface_type, f"iface={iface_type}") if iface_type is not None else ""
+
+            parts = [f"App: {app_name}"]
+            if user_name:
+                parts.append(f"User: {user_name}")
+            if profile:
+                parts.append(f"Network: {profile}")
+            if iface_label:
+                parts.append(iface_label)
+            if connected_sec:
+                parts.append(f"duration={connected_sec}s")
+
+            events.append({
+                "timestamp_ns":    ts_ns,
+                "timestamp_iso":   unix_ns_to_iso(ts_ns),
+                "macb":            "M",
+                "source":          "SRUM",
+                "artifact":        "SRUM NetworkConn",
+                "file_path":       app_name,
+                "message":         "  |  ".join(parts),
+                "is_fn_timestamp": False,
+                "tz_offset_secs":  0,
+            })
+        except Exception as exc:
+            log.debug("SRUM NetworkConn record error: %s", exc)
+
+    return events
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def parse(srum_path: str) -> List[Dict[str, Any]]:
@@ -673,6 +728,11 @@ def parse(srum_path: str) -> List[Dict[str, Any]]:
                     recs = _get_table_records_by_name(db, backend, tbl_name)
                     tbl_events = _parse_network_usage(recs, id_map, srum_path)
                     log.info("SRUM Network: %d events", len(tbl_events))
+                    events.extend(tbl_events)
+                elif _NETWORK_CONN_GUID in name_upper:
+                    recs = _get_table_records_by_name(db, backend, tbl_name)
+                    tbl_events = _parse_network_connectivity(recs, id_map, srum_path)
+                    log.info("SRUM NetworkConn: %d events", len(tbl_events))
                     events.extend(tbl_events)
             except Exception as exc:
                 log.warning("SRUM: error reading table %s — %s", tbl_name, exc)

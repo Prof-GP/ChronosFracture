@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 pub enum EventExtra {
     Mft      { mft_entry: u64 },
     Evtx     { event_id: u32, record_number: u64, channel: String, level: u8 },
-    Prefetch { exe_name: String, exe_path: String, run_count: u32, prefetch_hash: String, version: u32 },
-    Lnk      { target_path: String, drive_type: u32, drive_serial: String, volume_label: String },
+    Prefetch { exe_name: String, exe_path: String, run_count: u32, prefetch_hash: String, version: u32, modules: Vec<String> },
+    Lnk      { target_path: String, drive_type: u32, drive_serial: String, volume_label: String, arguments: String, machine_id: String, droid_file_id: String },
     Usn      { reasons: String, file_attributes: u32 },
     JumpList { target_path: String, destlist_version: Option<u32> },
 }
@@ -54,8 +54,13 @@ pub fn filetime_to_unix_ns(filetime: u64) -> i64 {
     if filetime < EPOCH_DIFF_100NS {
         return 0;
     }
-    // Convert 100-ns intervals to nanoseconds
-    ((filetime - EPOCH_DIFF_100NS) * 100) as i64
+    let diff = filetime - EPOCH_DIFF_100NS;
+    // Guard: * 100 can overflow u64 for corrupted FILETIMEs with high bits set.
+    // i64::MAX / 100 ≈ year 2462; anything beyond that is garbage.
+    if diff > (i64::MAX as u64) / 100 {
+        return 0;
+    }
+    (diff * 100) as i64
 }
 
 /// POSIX timestamp (seconds) to nanoseconds since Unix epoch
