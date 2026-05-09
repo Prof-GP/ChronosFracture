@@ -144,8 +144,12 @@ _EXTRACT_TARGETS: Dict[str, str] = {
     "Windows/appcompat/pca/PcaAppLaunchDic.txt": "PcaAppLaunchDic.txt",
     "Windows/appcompat/pca/PcaGeneralDb0.txt":   "PcaGeneralDb0.txt",
     "Windows/appcompat/pca/PcaGeneralDb1.txt":   "PcaGeneralDb1.txt",
+    "Windows/System32/Tasks":  "Tasks",
+    "$Recycle.Bin":            "RecycleBin",
     # Per-user Recent dirs are extracted dynamically by _tsk_extract_user_recent()
     # into Recent/<username>/ and registered here as a single directory target.
+    # Per-user Browser/WinTimeline/WER/PSHistory extracted by _tsk_extract_user_artifacts()
+    # into browser/<user>/, wintimeline/<user>/, wer/<user>/, pshistory/<user>/
 }
 
 # Maps extracted flat name → (artifact_type, is_directory)
@@ -167,6 +171,9 @@ EXTRACTED_ARTIFACT_MAP: Dict[str, Tuple[str, bool]] = {
     "PcaGeneralDb0.txt":     ("PCASVC",   False),
     "PcaGeneralDb1.txt":     ("PCASVC",   False),
     "Recent":       ("LNK",       True),    # per-user Recent dirs, extracted dynamically
+    "Tasks":        ("TASK",      True),    # Windows Task Scheduler XML tasks
+    "RecycleBin":   ("RECYCLEBIN",True),    # $Recycle.Bin — $I / $R pairs
+    # _tsk_extract_user_artifacts() and discovered by custom blocks in _discover_from_extracted()
 }
 
 
@@ -369,6 +376,113 @@ def _tsk_extract_user_recent(fs_obj, tmp_dir: str) -> int:
     return count
 
 
+def _tsk_extract_user_artifacts(fs_obj, tmp_dir: str) -> int:
+    """
+    Extract per-user browser history, Windows Timeline, WER reports,
+    PSHistory, and system WER from a pytsk3 filesystem object.
+
+    Output structure:
+        <tmp_dir>/browser/<username>/Chrome_Default_History
+        <tmp_dir>/browser/<username>/Edge_Default_History
+        <tmp_dir>/browser/<username>/Firefox_<profile>_places.sqlite
+        <tmp_dir>/wintimeline/<username>/ActivitiesCache.db
+        <tmp_dir>/wer/<username>/<report_dir>/<file>.wer
+        <tmp_dir>/wer_system/<report_dir>/<file>.wer
+        <tmp_dir>/pshistory/<username>/ConsoleHost_history.txt
+    """
+    count = 0
+    _SKIP_USERS = {".", "..", "All Users", "Default", "Default User", "Public"}
+
+    try:
+        users_dir = fs_obj.open_dir("Users")
+    except Exception:
+        users_dir = None
+
+    if users_dir is not None:
+        for entry in users_dir:
+            name = entry.info.name.name
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            if name in _SKIP_USERS:
+                continue
+            if not (entry.info.meta and entry.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR):
+                continue
+
+            # ── Browser: Chrome / Edge (fixed Default profile) ─────────────────
+            browser_dest = os.path.join(tmp_dir, "browser", name)
+            os.makedirs(browser_dest, exist_ok=True)
+            for src_rel, dest_name in [
+                (f"Users/{name}/AppData/Local/Google/Chrome/User Data/Default/History",
+                 "Chrome_Default_History"),
+                (f"Users/{name}/AppData/Local/Microsoft/Edge/User Data/Default/History",
+                 "Edge_Default_History"),
+            ]:
+                if _tsk_extract_file(fs_obj, src_rel, os.path.join(browser_dest, dest_name)):
+                    count += 1
+
+            # ── Browser: Firefox (enumerate profile directories) ────────────────
+            ff_profiles_path = f"Users/{name}/AppData/Roaming/Mozilla/Firefox/Profiles"
+            try:
+                ff_profiles_dir = fs_obj.open_dir(ff_profiles_path)
+                for pe in ff_profiles_dir:
+                    pname = pe.info.name.name
+                    if isinstance(pname, bytes):
+                        pname = pname.decode("utf-8", errors="replace")
+                    if pname in (".", ".."):
+                        continue
+                    if not (pe.info.meta and pe.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR):
+                        continue
+                    dest_file = os.path.join(browser_dest, f"Firefox_{pname}_places.sqlite")
+                    if _tsk_extract_file(fs_obj,
+                                         f"{ff_profiles_path}/{pname}/places.sqlite",
+                                         dest_file):
+                        count += 1
+            except Exception:
+                pass
+
+            # ── Windows Timeline (ConnectedDevicesPlatform — enum profiles) ─────
+            cdp_path = f"Users/{name}/AppData/Local/ConnectedDevicesPlatform"
+            wt_dest = os.path.join(tmp_dir, "wintimeline", name)
+            try:
+                cdp_dir = fs_obj.open_dir(cdp_path)
+                for pe in cdp_dir:
+                    pname = pe.info.name.name
+                    if isinstance(pname, bytes):
+                        pname = pname.decode("utf-8", errors="replace")
+                    if pname in (".", ".."):
+                        continue
+                    if not (pe.info.meta and pe.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR):
+                        continue
+                    dest_file = os.path.join(wt_dest, "ActivitiesCache.db")
+                    os.makedirs(wt_dest, exist_ok=True)
+                    if _tsk_extract_file(fs_obj,
+                                         f"{cdp_path}/{pname}/ActivitiesCache.db",
+                                         dest_file):
+                        count += 1
+                        break  # first profile that has the DB is sufficient
+            except Exception:
+                pass
+
+            # ── PSHistory ───────────────────────────────────────────────────────
+            ps_src = (f"Users/{name}/AppData/Roaming/Microsoft/Windows/"
+                      f"PowerShell/PSReadLine/ConsoleHost_history.txt")
+            ps_dest = os.path.join(tmp_dir, "pshistory", name)
+            os.makedirs(ps_dest, exist_ok=True)
+            if _tsk_extract_file(fs_obj, ps_src,
+                                  os.path.join(ps_dest, "ConsoleHost_history.txt")):
+                count += 1
+
+            # ── WER (per-user ReportArchive) ────────────────────────────────────
+            wer_src = (f"Users/{name}/AppData/Local/Microsoft/Windows/WER/ReportArchive")
+            count += _tsk_extract_dir(fs_obj, wer_src,
+                                       os.path.join(tmp_dir, "wer", name))
+
+    # ── WER (system — ProgramData) ────────────────────────────────────────────
+    count += _tsk_extract_dir(fs_obj, "ProgramData/Microsoft/Windows/WER/ReportArchive",
+                               os.path.join(tmp_dir, "wer_system"))
+    return count
+
+
 def _get_partition_offset(img_info) -> int:
     """
     Return byte offset of the largest NTFS partition.
@@ -502,7 +616,13 @@ def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
         _SPARSE_TARGETS = {"$Extend/$UsnJrnl:$J"}
 
         # Directories to recurse into
-        _DIR_TARGETS = {"Windows/System32/winevt/Logs", "Windows/Prefetch", "Windows/System32/sru"}
+        _DIR_TARGETS = {
+            "Windows/System32/winevt/Logs",
+            "Windows/Prefetch",
+            "Windows/System32/sru",
+            "Windows/System32/Tasks",
+            "$Recycle.Bin",
+        }
 
         for src_path, dest_name in _EXTRACT_TARGETS.items():
             if progress_cb:
@@ -523,6 +643,11 @@ def extract_artifacts_from_image(image_path: str, fmt: ImageFormat,
         if progress_cb:
             progress_cb("Users/*/NTUSER.DAT + UsrClass.dat")
         _tsk_extract_user_hives(fs, tmp_dir)
+
+        # Per-user browser history, WinTimeline, WER reports, PSHistory
+        if progress_cb:
+            progress_cb("Users/*/AppData (browser, WinTimeline, WER, PSHistory)")
+        _tsk_extract_user_artifacts(fs, tmp_dir)
 
         return tmp_dir
 

@@ -452,6 +452,90 @@ def _discover_from_extracted(root: str) -> List[ArtifactJob]:
                         logical_path=logical,
                     ))
 
+    # Per-user browser history files (Chrome_Default_History, Edge_Default_History,
+    # Firefox_<profile>_places.sqlite); parse_browser_db() picks parser via filename
+    browser_root = root_path / "browser"
+    if browser_root.is_dir():
+        for user_dir in browser_root.iterdir():
+            if not user_dir.is_dir():
+                continue
+            for db_file in user_dir.iterdir():
+                if not db_file.is_file():
+                    continue
+                try:
+                    size = db_file.stat().st_size
+                except OSError:
+                    size = 0
+                jobs.append(ArtifactJob(
+                    artifact_type="BROWSER",
+                    path=str(db_file),
+                    size_bytes=size,
+                    is_directory=False,
+                    logical_path=f"Users\\{user_dir.name}\\AppData\\Local\\{db_file.name}",
+                ))
+
+    # Per-user Windows Timeline (ActivitiesCache.db)
+    wt_root = root_path / "wintimeline"
+    if wt_root.is_dir():
+        for user_dir in wt_root.iterdir():
+            if not user_dir.is_dir():
+                continue
+            db_file = user_dir / "ActivitiesCache.db"
+            if db_file.is_file():
+                try:
+                    size = db_file.stat().st_size
+                except OSError:
+                    size = 0
+                jobs.append(ArtifactJob(
+                    artifact_type="WINTIMELINE",
+                    path=str(db_file),
+                    size_bytes=size,
+                    is_directory=False,
+                    logical_path=(f"Users\\{user_dir.name}\\AppData\\Local\\"
+                                  f"ConnectedDevicesPlatform\\*\\ActivitiesCache.db"),
+                ))
+
+    # WER — per-user (wer/<user>/**/*.wer) and system (wer_system/**/*.wer)
+    for wer_root_name in ("wer", "wer_system"):
+        wer_dir = root_path / wer_root_name
+        if not wer_dir.is_dir():
+            continue
+        for wer_file in wer_dir.rglob("*.wer"):
+            if not wer_file.is_file():
+                continue
+            try:
+                size = wer_file.stat().st_size
+            except OSError:
+                size = 0
+            jobs.append(ArtifactJob(
+                artifact_type="WER",
+                path=str(wer_file),
+                size_bytes=size,
+                is_directory=False,
+                logical_path=str(wer_file.relative_to(wer_dir)),
+            ))
+
+    # Per-user PSHistory (ConsoleHost_history.txt)
+    pshistory_root = root_path / "pshistory"
+    if pshistory_root.is_dir():
+        for user_dir in pshistory_root.iterdir():
+            if not user_dir.is_dir():
+                continue
+            hist_file = user_dir / "ConsoleHost_history.txt"
+            if hist_file.is_file():
+                try:
+                    size = hist_file.stat().st_size
+                except OSError:
+                    size = 0
+                jobs.append(ArtifactJob(
+                    artifact_type="PSHISTORY",
+                    path=str(hist_file),
+                    size_bytes=size,
+                    is_directory=False,
+                    logical_path=(f"Users\\{user_dir.name}\\AppData\\Roaming\\Microsoft\\"
+                                  f"Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt"),
+                ))
+
     jobs.sort(key=lambda j: j.size_bytes, reverse=True)
     log.info("Extracted temp dir: found %d artifact jobs in %s", len(jobs), root)
     return jobs
