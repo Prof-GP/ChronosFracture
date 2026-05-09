@@ -10,9 +10,19 @@ use crate::types::filetime_to_unix_ns;
 pub fn parse_wer_file(py: Python<'_>, file_path: &str) -> PyResult<Py<PyList>> {
     let list = PyList::empty_bound(py);
 
-    let content = match fs::read(file_path) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+    let raw = match fs::read(file_path) {
+        Ok(b) => b,
         Err(_) => return Ok(list.into()),
+    };
+    // WER files are UTF-16 LE with BOM (0xFF 0xFE) on modern Windows.
+    let content = if raw.starts_with(&[0xFF, 0xFE]) {
+        let u16_units: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&u16_units)
+    } else {
+        String::from_utf8_lossy(&raw).into_owned()
     };
 
     let mut event_time_ns: i64 = 0;
@@ -21,7 +31,7 @@ pub fn parse_wer_file(py: Python<'_>, file_path: &str) -> PyResult<Py<PyList>> {
     let mut app_version   = String::new();
 
     for line in content.lines() {
-        let line = line.trim_start_matches('\u{feff}').trim(); // strip BOM if present
+        let line = line.trim_start_matches('\u{feff}').trim(); // strip UTF-8 BOM if present
         if let Some((key, val)) = line.split_once('=') {
             let key = key.trim();
             let val = val.trim();
