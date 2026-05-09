@@ -15,7 +15,12 @@ from rich.text import Text
 from rich.console import Group
 
 from supertimeline.orchestrator import Orchestrator
-from supertimeline.storage.writer import StreamingWriter, sort_parquet_by_timestamp
+from supertimeline.storage.writer import (
+    StreamingWriter, ARROW_AVAILABLE,
+    post_process_parquet, merge_and_sort_parquet,
+    convert_parquet_to_csv, convert_parquet_to_jsonl,
+    write_sqlite_from_parquet, write_timesketch_from_parquet,
+)
 
 console = Console()
 
@@ -83,12 +88,12 @@ def _banner():
 @click.option("-o", "--output",  default="timeline.parquet", show_default=True,
               help="Output file path")
 @click.option("-f", "--format",  default="parquet",
-              type=click.Choice(["parquet", "jsonl", "csv"]), show_default=True,
-              help="Output format")
+              type=click.Choice(["parquet", "jsonl", "csv", "sqlite", "timesketch"]),
+              show_default=True, help="Output format")
 @click.option("-w", "--workers", default=0, show_default=True,
               help="Worker threads (0 = auto)")
 @click.option("--no-sort", is_flag=True, default=False,
-              help="Skip timestamp sort (parquet only)")
+              help="Skip timestamp sort")
 @click.option("--discover-only", is_flag=True, default=False,
               help="List artifacts without parsing")
 @click.option("--debug", is_flag=True, default=False,
@@ -146,6 +151,14 @@ def run(root_path, output, format, workers, no_sort, discover_only, debug, recov
                 orc.close()
         else:
             orc.close()
+
+
+def _safe_remove(path: str):
+    """Delete a file, ignoring errors."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _run_with_orchestrator(
@@ -210,7 +223,18 @@ def _run_with_orchestrator(
     type_errs:    dict = {}
     type_t0:      dict = {}
 
-    with StreamingWriter(output, format=format) as writer:
+    # Always stream to a temp Parquet when Arrow is available so we can sort/post-process
+    # regardless of the final output format. Falls back to streaming directly for no-Arrow.
+    if ARROW_AVAILABLE:
+        stream_path   = output + ".stream.parquet"
+        stream_format = "parquet"
+    else:
+        stream_path   = output
+        stream_format = format
+
+    hostname = ""   # collected from EVTX events during streaming
+
+    with StreamingWriter(stream_path, format=stream_format) as writer:
         with Progress(
             SpinnerColumn(spinner_name="dots"),
             TextColumn("[cyan]{task.fields[current]:<12}[/cyan]"),
@@ -228,6 +252,14 @@ def _run_with_orchestrator(
                 total_events += result.event_count
                 if result.error:
                     errors += 1
+
+                # Grab hostname from first EVTX event that carries one
+                if not hostname and result.artifact_type == "EVTX":
+                    for ev in result.events:
+                        h = ev.get("hostname", "")
+                        if h and h.strip():
+                            hostname = h
+                            break
 
                 t = result.artifact_type
                 if t not in type_t0:
@@ -271,8 +303,6 @@ def _run_with_orchestrator(
             r.event_count for r in orc.results if r.artifact_type == "USNJRNL"
         )
 
-        # 1. Scan zeroed $J — triggered when $J existed on image but live parse
-        #    found nothing (extractor skips all-zero streams, so check the image directly)
         if usnjrnl_live_events == 0 and orc.original_path != orc.root:
             with console.status("[cyan]Carving zeroed $J stream from image...[/cyan]"):
                 evs = recover_from_zeroed_j_image(orc.original_path)
@@ -283,7 +313,6 @@ def _run_with_orchestrator(
                     f"[white]{len(evs):>8,}[/white] events  [dim](zeroed $J)[/dim]"
                 )
         elif usnjrnl_live_events == 0:
-            # Extracted dir — check for a zeroed UsnJrnl_J file
             for job in jobs:
                 if job.artifact_type == "USNJRNL":
                     with console.status(f"[cyan]Carving zeroed $J: {os.path.basename(job.path)}[/cyan]"):
@@ -295,7 +324,6 @@ def _run_with_orchestrator(
                             f"[white]{len(evs):>8,}[/white] events  [dim](zeroed $J)[/dim]"
                         )
 
-        # 2. Full image scan — only when --recover-usnjrnl-deep is set (slow)
         if recover_usnjrnl_deep and orc.original_path != orc.root:
             console.print("  [yellow]Deep scan:[/yellow] scanning full image (this may take a while)...")
             with console.status("[cyan]Carving image for USN records...[/cyan]"):
@@ -311,30 +339,60 @@ def _run_with_orchestrator(
             console.print("  [dim]No additional USN records recovered.[/dim]")
         else:
             total_events += len(recovered_events)
-            # Write recovered events to a sidecar parquet; merged into main before sort
-            recovered_parquet = output.replace(".parquet", "_recovered_tmp.parquet")
+            recovered_parquet = stream_path + ".recovered.parquet"
             with StreamingWriter(recovered_parquet, format="parquet") as rw:
                 rw.write_events(recovered_events)
             console.print(
                 f"  [bold green]{len(recovered_events):,} total USN records recovered[/bold green]"
             )
 
-    # ── Sort ────────────────────────────────────────────────────────────────
-    sort_elapsed = 0.0
-    sorted_path = output
-    if not no_sort and format == "parquet" and total_events > 0:
+    # ── Post-process: merge recovered, sort, fill hostname, convert ──────────
+    post_elapsed = 0.0
+    final_path   = output
+
+    if ARROW_AVAILABLE and total_events > 0:
         console.print()
-        with console.status(f"[cyan]Sorting {total_events:,} events by timestamp...[/cyan]"):
-            t_sort = time.perf_counter()
-            sorted_path = output.replace(".parquet", "_sorted.parquet")
+        with console.status(f"[cyan]Post-processing {total_events:,} events...[/cyan]"):
+            t_post = time.perf_counter()
+
+            # Merge in recovered USN events if any
             if recovered_parquet and os.path.exists(recovered_parquet):
-                from supertimeline.storage.writer import merge_and_sort_parquet
-                merge_and_sort_parquet([output, recovered_parquet], sorted_path)
-                os.remove(recovered_parquet)
-            else:
-                sort_parquet_by_timestamp(output, sorted_path)
-            sort_elapsed = time.perf_counter() - t_sort
-        console.print(f"[green]Sorted:[/green] {sorted_path} ({sort_elapsed:.1f}s)")
+                merged_tmp = stream_path + ".merged.parquet"
+                merge_and_sort_parquet([stream_path, recovered_parquet], merged_tmp)
+                _safe_remove(stream_path)
+                _safe_remove(recovered_parquet)
+                stream_path = merged_tmp
+
+            # Sort + fill hostname → processed Parquet
+            processed_path = stream_path + ".processed.parquet"
+            post_process_parquet(
+                stream_path, processed_path,
+                hostname=hostname,
+                sort=not no_sort,
+            )
+            _safe_remove(stream_path)
+
+            # Convert to final format
+            if format == "parquet":
+                os.replace(processed_path, output)
+            elif format == "csv":
+                convert_parquet_to_csv(processed_path, output)
+                _safe_remove(processed_path)
+            elif format == "jsonl":
+                convert_parquet_to_jsonl(processed_path, output)
+                _safe_remove(processed_path)
+            elif format == "sqlite":
+                write_sqlite_from_parquet(processed_path, output)
+                _safe_remove(processed_path)
+            elif format == "timesketch":
+                write_timesketch_from_parquet(processed_path, output)
+                _safe_remove(processed_path)
+
+            post_elapsed = time.perf_counter() - t_post
+
+    elif not ARROW_AVAILABLE and stream_path != output:
+        # Arrow unavailable and we wrote to a temp path — rename to final
+        os.replace(stream_path, output)
 
     # ── Summary ─────────────────────────────────────────────────────────────
     wall_elapsed = time.perf_counter() - wall_start
@@ -345,10 +403,11 @@ def _run_with_orchestrator(
         f"[bold green]Timeline complete[/bold green]\n\n"
         f"  Total events  : [cyan]{total_events:,}[/cyan]\n"
         f"  Parse time    : [cyan]{parse_elapsed:.1f}s[/cyan]\n"
-        f"  Sort time     : [cyan]{sort_elapsed:.1f}s[/cyan]\n"
+        f"  Post-process  : [cyan]{post_elapsed:.1f}s[/cyan]\n"
         f"  Wall time     : [bold cyan]{wall_elapsed:.1f}s[/bold cyan]\n"
         f"  Throughput    : [cyan]{throughput:,} events/sec[/cyan]\n"
-        f"  Output        : [white]{sorted_path}[/white]"
+        f"  Output        : [white]{final_path}[/white]"
+        + (f"\n  [yellow]Hostname      : {hostname}[/yellow]" if hostname else "")
         + (f"\n  [yellow]Errors        : {errors}[/yellow]" if errors else ""),
         border_style="green",
         title="Summary",

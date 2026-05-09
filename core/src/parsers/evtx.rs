@@ -398,6 +398,121 @@ fn scan_for_channel(data: &[u8]) -> String {
     String::new() // empty → caller falls back to filename
 }
 
+/// Scan raw event bytes for the computer/hostname as a UTF-16LE string.
+/// All EVTX records use a BinXML fragment header (0x0F prefix) so the substitution
+/// table cannot be parsed with fixed offsets.  Instead we scan for hostname-like
+/// UTF-16LE strings (alphanumeric + hyphen + dot) and prefer candidates that match
+/// Windows computer name patterns (contains hyphen, or contains digits).
+fn scan_for_computer(data: &[u8]) -> String {
+    let start    = 0x18usize;
+    let scan_end = data.len().min(start + 1500);
+    let mut candidates: Vec<String> = Vec::new();
+
+    // Strings that appear in EVTX records but are never computer names
+    static COMPUTER_NOISE: &[&str] = &[
+        "SYSTEM", "WORKGROUP", "localhost", "LOCALHOST", "Everyone",
+        "ANONYMOUS", "NULL", "None", "builtin", "Builtin",
+        "Negotiate", "Kerberos", "NTLM", "Advapi",
+        "WS-Management", "Font", "AUTHORITY", "NETWORK",
+        "DWM-1","DWM-2","DWM-3","DWM-4","DWM-5",
+        "UMFD-0","UMFD-1","UMFD-2","UMFD-3","UMFD-4",
+        "LOCAL", "SERVICE", "Window", "Manager",
+        "LOCAL-SERVICE", "NETWORK-SERVICE",
+    ];
+
+    let mut i = start;
+    while i + 1 < scan_end {
+        let lo = data[i];
+        let hi = data[i + 1];
+        if hi != 0 || !lo.is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let (len, end) = measure_utf16le_run(data, i);
+        // Require at least 4 chars to filter out short fragments (Ses, ows, Gro, etc.)
+        if (4..=64).contains(&len) {
+            if let Some(s) = extract_utf16le_str(data, i, len) {
+                let hostname_chars = s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+                // Reject CamelCase strings — these are BinXML field names
+                // (PolicyApplicationMode, ReasonForSyncProcessing, OldTime, etc.)
+                // Computer names are all-uppercase or all-lowercase, not mixed.
+                let is_camel_case = s.chars().zip(s.chars().skip(1))
+                    .any(|(a, b)| a.is_ascii_lowercase() && b.is_ascii_uppercase());
+                if hostname_chars
+                    && !is_camel_case
+                    && !s.starts_with('-') && !s.ends_with('-')
+                    && !s.starts_with('.') && !s.ends_with('.')
+                    && !s.chars().all(|c| c.is_ascii_digit())
+                    && !is_noise_string(&s)
+                    && !is_generic_noise(&s)
+                    && !COMPUTER_NOISE.iter().any(|n| s.eq_ignore_ascii_case(n))
+                {
+                    candidates.push(s);
+                }
+            }
+        }
+        i = if len >= 4 { end } else { i + 1 };
+    }
+
+    if candidates.is_empty() {
+        return String::new();
+    }
+
+    // Only emit a hostname when we're highly confident.  Events without a confident
+    // match get an empty field which post_process_parquet fills with the timeline hostname.
+    //
+    // Windows NetBIOS computer names (DESKTOP-SC2N5CT, SERVER01) are ALWAYS all-uppercase.
+    // This single property filters out GUIDs (lowercase hex), package IDs (mixed case),
+    // and URL fragments that share the alphanumeric+hyphen character set.
+
+    let all_alpha_upper = |s: &str| -> bool {
+        s.chars().filter(|c| c.is_ascii_alphabetic()).all(|c| c.is_ascii_uppercase())
+            && s.chars().any(|c| c.is_ascii_alphabetic())
+    };
+
+    // True if every alphabetic char is a hex digit (A-F) — indicates a SID/GUID component
+    let is_all_hex_alpha = |s: &str| -> bool {
+        s.chars().filter(|c| c.is_ascii_alphabetic())
+            .all(|c| matches!(c, 'A'..='F' | 'a'..='f'))
+            && s.chars().any(|c| c.is_ascii_alphabetic())
+    };
+
+    // Rule 1: NETBIOS-style name with hyphen (DESKTOP-XXXXX, WS-01)
+    //   - all-uppercase alphabetic chars (not mixed-case package IDs, not lowercase GUIDs)
+    //   - no dots (dots = URL or FQDN, not NetBIOS)
+    //   - fewer than 4 hyphens (GUIDs have exactly 4)
+    //   - length >= 5 to reject short scanner fragments (P-SC, y-Au, etc.)
+    if let Some(s) = candidates.iter().find(|s| {
+        s.contains('-')
+            && !s.contains('.')
+            && s.chars().count() >= 5
+            && all_alpha_upper(s)
+            && s.chars().filter(|c| *c == '-').count() < 4
+            && !is_all_hex_alpha(s)
+    }) {
+        return s.clone();
+    }
+
+    // Rule 2: Uppercase-only name without hyphen (SERVER01, DC03)
+    //   - all-uppercase alphabetic chars
+    //   - contains at least one digit (separates "SERVER01" from noise like "AUTHORITY")
+    //   - length >= 5
+    //   - not a KB article ID (KB + digits), not a pure-hex string (SID/GUID fragment)
+    if let Some(s) = candidates.iter().find(|s| {
+        !s.contains('-') && !s.contains('.')
+            && s.chars().count() >= 5
+            && all_alpha_upper(s)
+            && s.chars().any(|c| c.is_ascii_digit())
+            && !s.starts_with("KB")
+            && !is_all_hex_alpha(s)
+    }) {
+        return s.clone();
+    }
+
+    // No confident match
+    String::new()
+}
+
 fn logon_type_name(t: u32) -> &'static str {
     match t {
         2  => "Interactive",
@@ -462,6 +577,28 @@ fn parse_subst_table(xml_data: &[u8]) -> Option<(usize, Vec<u8>, Vec<usize>)> {
     if val_start.saturating_add(total) > xml_data.len() { return None; }
 
     Some((val_start, types, sizes))
+}
+
+/// Return the UTF-16LE BX_STRING at substitution index `target_idx`, or None.
+fn subst_get_string_at(
+    xml_data:   &[u8],
+    val_start:  usize,
+    types:      &[u8],
+    sizes:      &[usize],
+    target_idx: usize,
+) -> Option<String> {
+    if target_idx >= types.len() { return None; }
+    if types[target_idx] != BX_STRING { return None; }
+    let sz = sizes[target_idx];
+    if sz < 2 || sz % 2 != 0 { return None; }
+    let off: usize = sizes[..target_idx].iter().sum();
+    let abs = val_start + off;
+    if abs + sz > xml_data.len() { return None; }
+    let u16s: Vec<u16> = xml_data[abs..abs + sz].chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+    let s = String::from_utf16_lossy(&u16s);
+    let s = s.trim_end_matches('\0').trim();
+    if s.is_empty() { None } else { Some(s.to_string()) }
 }
 
 /// Decode every BX_STRING substitution value into a Vec<String>.
@@ -845,7 +982,10 @@ fn parse_event_record(data: &[u8]) -> Option<EvtxRecord> {
     let xml_data = &data[0x18..];
 
     let mut event_id: u32 = 0;
-    let computer = String::new();
+
+    // All EVTX records use BinXML fragment header (0x0F prefix), so the substitution
+    // table cannot be parsed at a fixed offset.  Use a byte-scan approach instead.
+    let computer = scan_for_computer(data);
 
     // EventID: substitution value area starts at BinXML offset 0x5E for standard events.
     // Raw record offset = 0x18 + 0x5E = 0x76.
@@ -1025,6 +1165,9 @@ pub fn parse_evtx_file(py: Python<'_>, path: &str) -> PyResult<Py<PyList>> {
         dict.set_item("source", &ev.source)?;
         dict.set_item("artifact", &ev.artifact)?;
         dict.set_item("message", &ev.message)?;
+        if let Some(ref h) = ev.hostname {
+            dict.set_item("hostname", h.as_str())?;
+        }
         dict.set_item("is_fn_timestamp", ev.is_fn_timestamp)?;
         dict.set_item("tz_offset_secs", ev.tz_offset_secs)?;
         if let Some(EventExtra::Evtx { event_id, record_number, channel, level }) = &ev.extra {
