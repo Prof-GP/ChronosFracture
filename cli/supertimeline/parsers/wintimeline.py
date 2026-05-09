@@ -94,7 +94,8 @@ def parse_wintimeline(db_path: str) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     conn = tmp = None
     try:
-        tmp = tempfile.mktemp(suffix=".db")
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
         shutil.copy2(db_path, tmp)
         conn = sqlite3.connect(tmp)
         conn.row_factory = sqlite3.Row

