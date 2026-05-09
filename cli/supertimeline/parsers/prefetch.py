@@ -225,18 +225,20 @@ def _decompress_mam_file(pf_path: Path, raw: bytes) -> bytes:
         log.warning("DecompressWin10 failed for %s: %s", pf_path.name, exc)
         return b""
 
-    # Linux/WSL: call Windows Python via WSL interop
+    # Linux/WSL: call Windows Python via WSL interop.
+    # Pass the path as sys.argv[1] — never embed filesystem paths in code strings.
     try:
         import subprocess, shutil
         win_python = shutil.which("python.exe")
         if win_python:
             script = (
                 "import sys; from windowsprefetch.utils import DecompressWin10; "
-                f"data = DecompressWin10().decompress(r'{pf_path}'); "
-                "sys.stdout.buffer.write(bytes(data))"
+                "sys.stdout.buffer.write(bytes(DecompressWin10().decompress(sys.argv[1])))"
             )
-            result = subprocess.run([win_python, "-c", script],
-                                    capture_output=True, timeout=10)
+            result = subprocess.run(
+                [win_python, "-c", script, str(pf_path)],
+                capture_output=True, timeout=10,
+            )
             if result.returncode == 0 and result.stdout:
                 return result.stdout
     except Exception as exc:

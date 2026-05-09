@@ -17,6 +17,11 @@ use parsers::evtx::EvtxParser;
 use parsers::prefetch::PrefetchParser;
 use parsers::lnk::{parse_lnk_bytes, parse_lnk_dir};
 use parsers::jumplists::parse_jumplist_bytes;
+use parsers::recyclebin::parse_recyclebin_dir;
+use parsers::pshistory::parse_pshistory_file;
+use parsers::wer::parse_wer_file;
+use parsers::tasks::parse_tasks_dir;
+use parsers::shellbags::parse_shellbags;
 
 /// Expose the Rust LZXPRESS Huffman decompressor to Python.
 /// Cross-platform — no Windows API, no external libraries.
@@ -42,6 +47,11 @@ fn supertimeline_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_lnk_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(parse_lnk_dir, m)?)?;
     m.add_function(wrap_pyfunction!(parse_jumplist_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_recyclebin_dir, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_pshistory_file, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_wer_file, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_tasks_dir, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_shellbags, m)?)?;
     m.add_function(wrap_pyfunction!(decompress_mam_py, m)?)?;
     Ok(())
 }

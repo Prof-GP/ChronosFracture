@@ -106,11 +106,17 @@ See [`requirements-linux.txt`](cli/requirements-linux.txt) for E01 mount command
 # Parse a mounted forensic image at E:\
 supertimeline run E:\ -o case001.parquet
 
-# JSONL output for Timesketch
+# JSONL output
 supertimeline run E:\ -o case001.jsonl -f jsonl
 
-# CSV output for spreadsheet analysis
+# CSV output (sorted, ready for Excel/Timeline Explorer)
 supertimeline run E:\ -o case001.csv -f csv
+
+# SQLite output (load with DB Browser or custom queries)
+supertimeline run E:\ -o case001.db -f sqlite
+
+# Timesketch-native CSV (datetime/timestamp_desc/source columns)
+supertimeline run E:\ -o case001_ts.csv -f timesketch
 
 # Explicit thread count
 supertimeline run E:\ -o case001.parquet -w 16
@@ -136,17 +142,25 @@ When `$UsnJrnl:$J` has been wiped, use `--recover-usnjrnl` to carve remnant USN 
 
 ## Parsers
 
-| Artifact | Method | Events per file |
+| Artifact | Source | Method |
 |---|---|---|
-| `$MFT` | Rust, mmap + rayon | 8 timestamps per file entry |
-| `$UsnJrnl:$J` | Rust, 64MB parallel chunks | 1 per change record |
-| Windows Event Logs (`.evtx`) | Rust, 64KB parallel chunks | 1 per event |
-| Prefetch (`.pf`) | Rust, parallel per-file | Up to 8 last-run times |
-| LNK / Jump Lists | Rust + Python glue | 3 per `.lnk`; 1 per Jump List entry |
-| Registry hives | Python | 1 per key (last-written time) |
-| SRUM (`SRUDB.dat`) | Python | 1 per record |
-| Amcache (`Amcache.hve`) | Python | 1 per entry |
-| PcaSvc (`PcaAppLaunchDic.txt`, `PcaGeneralDb*.txt`) | Python | 1 per execution record (Windows 11 22H2+) |
+| `$MFT` | `MFT` | Rust, mmap + rayon — 8 timestamps per file entry |
+| `$UsnJrnl:$J` | `USNJRNL` | Rust, 64MB parallel chunks |
+| `$LogFile` | `LOGFILE` | Python |
+| Windows Event Logs (`.evtx`) | `EVTX` | Rust, 64KB parallel chunks |
+| Prefetch (`.pf`) | `PREFETCH` | Rust, parallel — up to 8 last-run times |
+| LNK / Jump Lists | `LNK` / `JUMPLIST` | Rust + Python glue |
+| Registry hives | `REGISTRY` | Python |
+| SRUM (`SRUDB.dat`) | `SRUM` | Python |
+| Amcache (`Amcache.hve`) | `AMCACHE` | Python |
+| PcaSvc (Windows 11 22H2+) | `PCASVC` | Python |
+| ShellBags (`UsrClass.dat`) | `SHELLBAG` | Rust |
+| Scheduled Tasks (`Tasks/`) | `TASK` | Rust |
+| Browser history (Chrome/Edge/Firefox) | `BROWSER` | Python |
+| Windows Timeline (`ActivitiesCache.db`) | `WINTIMELINE` | Python |
+| Recycle Bin (`$Recycle.Bin`) | `RECYCLEBIN` | Rust |
+| Windows Error Reporting (`.wer`) | `WER` | Rust |
+| PowerShell history (`ConsoleHost_history.txt`) | `PSHISTORY` | Rust |
 
 ---
 
@@ -168,7 +182,7 @@ WHERE source = 'EVTX' AND timestamp_iso > '2024-01-01'
 ORDER BY timestamp_ns LIMIT 100;
 ```
 
-JSONL and CSV are also supported (`-f jsonl` / `-f csv`).
+Additional formats: JSONL (`-f jsonl`), CSV (`-f csv`), SQLite (`-f sqlite`), Timesketch-native CSV (`-f timesketch`).
 
 ---
 

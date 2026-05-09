@@ -150,7 +150,7 @@ def _parse_legacy_amcache(root_key, artifact_path: str) -> List[Dict[str, Any]]:
 
 
 def _parse_inventory_driver_binary(root_key, artifact_path: str) -> List[Dict[str, Any]]:
-    """Root\InventoryDriverBinary — driver SHA1, inf path, driver type."""
+    r"""Root\InventoryDriverBinary — driver SHA1, inf path, driver type."""
     events: List[Dict[str, Any]] = []
 
     drv_key = None
@@ -211,7 +211,7 @@ def _parse_inventory_driver_binary(root_key, artifact_path: str) -> List[Dict[st
 
 
 def _parse_inventory_application(root_key, artifact_path: str) -> List[Dict[str, Any]]:
-    """Root\InventoryApplication — installed software timeline."""
+    r"""Root\InventoryApplication — installed software timeline."""
     events: List[Dict[str, Any]] = []
 
     app_key = None
