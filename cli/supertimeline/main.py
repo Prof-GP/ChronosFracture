@@ -104,7 +104,9 @@ def _banner():
               help="Carve entire image for USN records including unallocated space (slow)")
 @click.option("--verbose", "-v", is_flag=True, default=False,
               help="Show parser warnings and errors (enables logging)")
-def run(root_path, output, format, workers, no_sort, discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep, verbose):
+@click.option("--vss", is_flag=True, default=False,
+              help="Diff Volume Shadow Copies against current filesystem; add deleted artifacts to timeline (Windows only, requires pytsk3)")
+def run(root_path, output, format, workers, no_sort, discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep, verbose, vss):
     """
     Generate a forensic super-timeline from ROOT_PATH.
 
@@ -143,7 +145,7 @@ def run(root_path, output, format, workers, no_sort, discover_only, debug, recov
         _run_with_orchestrator(
             orc, root_path, output, format, workers, no_sort,
             discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep,
-            wall_start, max_workers,
+            wall_start, max_workers, vss=vss,
         )
     finally:
         if had_tmp:
@@ -164,7 +166,7 @@ def _safe_remove(path: str):
 def _run_with_orchestrator(
     orc, root_path, output, format, workers, no_sort,
     discover_only, debug, recover_usnjrnl, recover_usnjrnl_deep,
-    wall_start, max_workers,
+    wall_start, max_workers, vss=False,
 ):
     # Run info table — printed once after image opens so we have the format name
     info = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2))
@@ -234,6 +236,10 @@ def _run_with_orchestrator(
 
     hostname = ""   # collected from EVTX events during streaming
 
+    # VSS lookup sets — built during streaming so we avoid re-reading parquet later
+    vss_mft_paths: set = set()
+    vss_reg_keys:  set = set()
+
     with StreamingWriter(stream_path, format=stream_format) as writer:
         with Progress(
             SpinnerColumn(spinner_name="dots"),
@@ -252,6 +258,11 @@ def _run_with_orchestrator(
                 total_events += result.event_count
                 if result.error:
                     errors += 1
+
+                # Build VSS lookup sets incrementally during streaming
+                if vss:
+                    from supertimeline.vss import build_current_sets
+                    build_current_sets(vss_mft_paths, vss_reg_keys, result.events)
 
                 # Grab hostname from first EVTX event that carries one
                 if not hostname and result.artifact_type == "EVTX":
@@ -346,6 +357,54 @@ def _run_with_orchestrator(
                 f"  [bold green]{len(recovered_events):,} total USN records recovered[/bold green]"
             )
 
+    # ── VSS delta ────────────────────────────────────────────────────────────
+    vss_parquet = None
+    vss_event_count = 0
+    if vss:
+        from supertimeline.vss import enumerate_shadow_copies, compute_vss_delta
+        console.print()
+        with console.status("[cyan]Enumerating Volume Shadow Copies...[/cyan]"):
+            shadow_copies = enumerate_shadow_copies()
+
+        if not shadow_copies:
+            console.print("  [dim]No shadow copies found on this system.[/dim]")
+        else:
+            console.print(
+                f"  [cyan]Found {len(shadow_copies)} shadow copy(s)[/cyan] — "
+                f"diffing against {len(vss_mft_paths):,} current paths "
+                f"and {len(vss_reg_keys):,} registry keys"
+            )
+            vss_delta: list = []
+            for i, (idx, vss_path, _ts) in enumerate(shadow_copies, 1):
+                label = f"VSS#{idx}"
+                with console.status(
+                    f"[cyan]  [{i}/{len(shadow_copies)}] Parsing {label}...[/cyan]"
+                ):
+                    from supertimeline.vss import _compute_snapshot_delta
+                    snap_delta = _compute_snapshot_delta(
+                        idx, vss_path, vss_mft_paths, vss_reg_keys
+                    )
+                vss_delta.extend(snap_delta)
+                mft_d = sum(1 for e in snap_delta if e.get('artifact') == 'Deleted File (VSS)')
+                reg_d = sum(1 for e in snap_delta if 'Registry' in e.get('artifact', ''))
+                console.print(
+                    f"  [green] OK[/green]  [cyan]{label:<10}[/cyan]  "
+                    f"[white]{len(snap_delta):>8,}[/white] delta events  "
+                    f"[dim]({mft_d:,} files, {reg_d:,} keys)[/dim]"
+                )
+
+            if vss_delta:
+                vss_parquet = stream_path + ".vss.parquet"
+                with StreamingWriter(vss_parquet, format="parquet") as vw:
+                    vw.write_events(vss_delta)
+                vss_event_count = len(vss_delta)
+                total_events += vss_event_count
+                console.print(
+                    f"  [bold green]{vss_event_count:,} total VSS delta events[/bold green]"
+                )
+            else:
+                console.print("  [dim]No deleted artifacts found in shadow copies.[/dim]")
+
     # ── Post-process: merge recovered, sort, fill hostname, convert ──────────
     post_elapsed = 0.0
     final_path   = output
@@ -355,12 +414,17 @@ def _run_with_orchestrator(
         with console.status(f"[cyan]Post-processing {total_events:,} events...[/cyan]"):
             t_post = time.perf_counter()
 
-            # Merge in recovered USN events if any
-            if recovered_parquet and os.path.exists(recovered_parquet):
+            # Merge in recovered USN events and/or VSS delta events if any
+            extra_parquets = [
+                p for p in [recovered_parquet, vss_parquet]
+                if p and os.path.exists(p)
+            ]
+            if extra_parquets:
                 merged_tmp = stream_path + ".merged.parquet"
-                merge_and_sort_parquet([stream_path, recovered_parquet], merged_tmp)
+                merge_and_sort_parquet([stream_path] + extra_parquets, merged_tmp)
                 _safe_remove(stream_path)
-                _safe_remove(recovered_parquet)
+                for p in extra_parquets:
+                    _safe_remove(p)
                 stream_path = merged_tmp
 
             # Sort + fill hostname → processed Parquet
@@ -408,6 +472,7 @@ def _run_with_orchestrator(
         f"  Throughput    : [cyan]{throughput:,} events/sec[/cyan]\n"
         f"  Output        : [white]{final_path}[/white]"
         + (f"\n  [yellow]Hostname      : {hostname}[/yellow]" if hostname else "")
+        + (f"\n  [cyan]VSS delta     : {vss_event_count:,} events[/cyan]" if vss_event_count else "")
         + (f"\n  [yellow]Errors        : {errors}[/yellow]" if errors else ""),
         border_style="green",
         title="Summary",
