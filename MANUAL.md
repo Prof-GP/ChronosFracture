@@ -258,8 +258,8 @@ supertimeline C:\Cases\Case001\artifacts\ -o case001.parquet
 
 | Component | Specification |
 |---|---|
-| CPU | AMD Ryzen 9 5900X (12 cores / 24 threads) |
-| RAM | 64 GB DDR4-3200 |
+| CPU | Intel Core i5 (13th gen) |
+| RAM | 32 GB |
 | Evidence read | NVMe SSD (Samsung 980 Pro, 3.5 GB/s seq read) |
 | Output write | SATA SSD (550 MB/s) |
 | OS | Windows 11 / Ubuntu 22.04 |
